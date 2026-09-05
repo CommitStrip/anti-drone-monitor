@@ -379,7 +379,10 @@ class YoloDroneDetector{
       if(!this.ort) throw new Error('onnxruntime-web 未加载');
       const wasmDir='.';
       this.ort.env.wasm.wasmPaths=wasmDir+'/';
-      this.ort.env.wasm.numThreads=1;   // 最低配置 1 核
+      // 多线程 wasm 需要 SharedArrayBuffer（跨域隔离）；WebView file:// 下不可用，自动回退 1 线程
+      this.ort.env.wasm.numThreads =
+        (typeof SharedArrayBuffer!=='undefined')
+          ? Math.min(4, navigator.hardwareConcurrency||1) : 1;
       this.session = await this.ort.InferenceSession.create('./yolov8s-drone.onnx',{
         executionProviders:['wasm'],
         graphOptimizationLevel:'all'
@@ -495,7 +498,9 @@ class JepaDiscriminator{
       this.ort=window.ort||globalThis.ort;
       if(!this.ort) throw new Error('onnxruntime-web 未加载');
       this.ort.env.wasm.wasmPaths='./';
-      this.ort.env.wasm.numThreads=1;
+      this.ort.env.wasm.numThreads =
+        (typeof SharedArrayBuffer!=='undefined')
+          ? Math.min(4, navigator.hardwareConcurrency||1) : 1;
       this.session=await this.ort.InferenceSession.create('./dinov2_vits14_feat.onnx',{
         executionProviders:['wasm'], graphOptimizationLevel:'all'});
       // 加载探针头（优先本地持久化的已学习探针，否则用初始化权重）
@@ -863,24 +868,34 @@ async function loop(){
         return {cls:d.cls,conf:d.conf,bbox:[bx,by,bw,bh],cx:bx+bw/2,cy:by+bh/2,
           dist:estimateDist(b[3],vh),zoom};
       });
-      // JEPA 判别：对最高置信度目标提取特征并分类(鸟/无人机)，结果叠加到遥测
-      if(dets.length && jepa.loaded){
-        const top=dets[0];
-        try{
-          const bx=top.bbox[0]*vw, by=top.bbox[1]*vh, bw=top.bbox[2]*vw, bh=top.bbox[3]*vh;
-          const feat=await jepa.features(srcCanvas, bx,by,bw,bh);
-          const jp=jepa.predict(feat);
-          top.jp=jp; pendingJepa=jp;
-          top.feat=feat;   // 供反馈按钮做在线后训练
-          pendingFeedback=feat;
-          tele._log({ty:'det',cls:jp.label,conf:Math.round(jp.droneScore*1000)/1000,
-            bird:Math.round(jp.birdScore*1000)/1000,dist:top.dist,zoom});
-        }catch(e){ tele.err('JEPA 判别失败:'+e.message); }
-      }
       // 跟踪
       const t4=performance.now();
       tracker.update(dets,now);
       lastDet=now;
+      // JEPA 判别：只对已确认目标提特征并节流（DINOv2 是重活）——
+      // 首次确认立即判别，此后每 reconfirmInterval 重复一次（持续在场目标刷新学习特征）
+      if(jepa.loaded){
+        let top=null;
+        for(const d of dets){
+          const trk=d.trackId!==undefined? tracker.tracks.get(d.trackId):null;
+          if(!trk||!trk.confirmed) continue;
+          if(trk.lastJepaAt!==undefined && now-trk.lastJepaAt<CFG.reconfirmInterval) continue;
+          if(top===null || d.conf>top.conf) top=d;
+        }
+        if(top){
+          try{
+            const bx=top.bbox[0]*vw, by=top.bbox[1]*vh, bw=top.bbox[2]*vw, bh=top.bbox[3]*vh;
+            const feat=await jepa.features(srcCanvas, bx,by,bw,bh);
+            const jp=jepa.predict(feat);
+            top.jp=jp; pendingJepa=jp;
+            top.feat=feat;   // 供反馈按钮做在线后训练
+            pendingFeedback=feat;
+            const trk2=tracker.tracks.get(top.trackId); if(trk2) trk2.lastJepaAt=now;
+            tele._log({ty:'det',cls:jp.label,conf:Math.round(jp.droneScore*1000)/1000,
+              bird:Math.round(jp.birdScore*1000)/1000,dist:top.dist,zoom});
+          }catch(e){ tele.err('JEPA 判别失败:'+e.message); }
+        }
+      }
       // 确认事件：每个目标首次确认立即告警，此后按 reconfirmInterval 重复
       for(const t of tracker.tracks.values()){
         if(t.confirmed && (t.lastConfirmAt===undefined ||
@@ -914,8 +929,14 @@ function drawOverlay(vw,vh,t0){
   const zw=vw/zoom, zh=vh/zoom;
   let cx=vw/2, cy=vh/2;
   if(modeFollow){
-    const conf=tracker.getConfirmed()[0]||tracker.tracks.values().next().value;
-    if(conf) cx=conf.cx*vw,cy=conf.cy*vh;   // 目标跟随
+    // 主目标选择：确认目标优先，同级取画框最大者（通常最近/最显著）
+    let focus=null;
+    for(const t of tracker.tracks.values()){
+      if(!focus){ focus=t; continue; }
+      const fc=focus.confirmed?1:0, tc=t.confirmed?1:0;
+      if(tc>fc || (tc===fc && t.box[2]*t.box[3]>focus.box[2]*focus.box[3])) focus=t;
+    }
+    if(focus) cx=focus.cx*vw,cy=focus.cy*vh;   // 目标跟随
   }
   const sx=Math.max(0,Math.min(vw-zw,cx-zw/2));
   const sy=Math.max(0,Math.min(vh-zh,cy-zh/2));
