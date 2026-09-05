@@ -190,9 +190,9 @@ const CFG = {
   motionThresh: 25,        // 帧差阈值
   minAreaRatio: 0.0003,    // 最小运动面积(占画面)
   confirmCount: 2,         // 多帧确认次数
-  confirmWindow: 3000,     // 确认时间窗(ms)
-  targetCooldown: 1500,    // 有目标时检测冷却(ms)
-  patrolInterval: 5000,    // 无目标时巡检间隔(ms)
+  motionDetInterval: 400,  // 快系统检出运动时，慢系统检测的最小间隔(ms)
+  patrolInterval: 5000,    // 无运动时巡检间隔(ms)
+  reconfirmInterval: 30000,// 已确认目标的重复告警间隔(ms)
   maxAge: 2000,            // 跟踪老化(ms)
   iouThresh: 0.1,
   focalMeters: 4.4e-3,     // 手机等效焦距(米)
@@ -276,25 +276,27 @@ class Telemetry {
 const tele=new Telemetry();
 
 // ---------- 几何：距离估算(针孔模型) ----------
-function estimateDist(bboxHpx, frameHpx, zoom){
+function estimateDist(bboxHpx, frameHpx){
   // D = (f * H_obj * frameH) / (h_px * sensorH)
+  // 注意：数字变焦只是 canvas 中心裁剪，检测始终在全帧上进行，
+  // 目标在全帧中的像素高度不随 zoom 变化——故这里不能除以 zoom
   const normalized = bboxHpx / frameHpx;          // 占画面高度比例
   const apparent = normalized * CFG.sensorHM;      // 像平面高度(米)
   if(apparent<=0) return null;
-  return (CFG.focalMeters * CFG.droneSizeM) / apparent / zoom;
+  return (CFG.focalMeters * CFG.droneSizeM) / apparent;
 }
 
-// ---------- IoU ----------
+// ---------- IoU（框格式统一为 [x,y,w,h] 归一化数组） ----------
 function iou(a,b){
-  const x1=Math.max(a.x,b.x),y1=Math.max(a.y,b.y);
-  const x2=Math.min(a.x+a.w,b.x+b.w),y2=Math.min(a.y+a.h,b.y+b.h);
+  const x1=Math.max(a[0],b[0]),y1=Math.max(a[1],b[1]);
+  const x2=Math.min(a[0]+a[2],b[0]+b[2]),y2=Math.min(a[1]+a[3],b[1]+b[3]);
   const iw=Math.max(0,x2-x1),ih=Math.max(0,y2-y1);
   if(iw<=0||ih<=0) return 0;
-  const inter=iw*ih, ua=a.w*a.h+b.w*b.h-inter;
+  const inter=iw*ih, ua=a[2]*a[3]+b[2]*b[3]-inter;
   return ua>0?inter/ua:0;
 }
 
-// ---------- 目标跟踪器(IoU+中心距离) ----------
+// ---------- 目标跟踪器(IoU+中心距离, 恒速预测) ----------
 class Tracker{
   constructor(){ this.tracks=new Map(); this.nextId=1; }
   update(dets,now){
@@ -303,20 +305,31 @@ class Tracker{
       let best=null,bestScore=1e9;
       for(const [id,t] of this.tracks){
         if(active.has(id)) continue;
-        const dist=Math.hypot(t.cx-d.cx,t.cy-d.cy);
-        const i=iou(t.box,d.box);
+        // 恒速预测：两次检测间隔 0.4~5s，快速目标直接比对新位置必然错配
+        const dt=(now-t.last)/1000;
+        const px=t.cx+(t.vx||0)*dt, py=t.cy+(t.vy||0)*dt;
+        const shiftX=px-t.cx, shiftY=py-t.cy;
+        const pred=[t.box[0]+shiftX,t.box[1]+shiftY,t.box[2],t.box[3]];
+        const dist=Math.hypot(px-d.cx,py-d.cy);
+        const i=iou(pred,d.bbox);
         const score=dist - i*200;   // IoU 优先,中心距离兜底
         if(score<bestScore){bestScore=score;best=id;}
       }
       if(best!==null && bestScore<300){
         const t=this.tracks.get(best);
-        t.box=d.box; t.cx=d.cx; t.cy=d.cy; t.last=now; t.count++;
+        const dt=(now-t.last)/1000;
+        if(dt>0.01){
+          const vx=(d.cx-t.cx)/dt, vy=(d.cy-t.cy)/dt;
+          t.vx=(t.vx||0)*0.6+vx*0.4; t.vy=(t.vy||0)*0.6+vy*0.4;  // 速度一阶平滑
+        }
+        t.box=d.bbox.slice(); t.cx=d.cx; t.cy=d.cy; t.last=now; t.count++;
         active.add(best);
         if(t.count>=CFG.confirmCount) t.confirmed=true;
         d.trackId=best; d.dup=t.count;
       }else{
         const id=this.nextId++;
-        this.tracks.set(id,{id,box:d.box,cx:d.cx,cy:d.cy,last:now,count:1,confirmed:false});
+        this.tracks.set(id,{id,box:d.bbox.slice(),cx:d.cx,cy:d.cy,vx:0,vy:0,
+          last:now,count:1,confirmed:false});
         active.add(id); d.trackId=id; d.dup=1;
       }
     }
@@ -327,38 +340,36 @@ class Tracker{
   getConfirmed(){ return [...this.tracks.values()].filter(t=>t.confirmed); }
 }
 
-// ---------- 帧差运动门控(快系统) ----------
+// ---------- 帧差运动门控(快系统)：逐帧廉价运行，有运动才升级慢系统检测 ----------
 class MotionGate{
   constructor(){ this.prev=null; }
-  // 返回运动 bounding box(归一化),无则 null
-  detect(gray){
-    const res=[]
-    if(this.prev!==null){
-      const diff=new cvsub(gray,this.prev);
-      const area=diff.reduce((a,v)=>a+(v>CFG.motionThresh?1:0),0);
-      const H=gray.length,W=gray[0].length;
-      if(area/W/H>CFG.minAreaRatio){
-        let minX=W,maxX=0,minY=H,maxY=0,cnt=0;
-        for(let y=0;y<H;y++) for(let x=0;x<W;x++) if(diff[y][x]>CFG.motionThresh){
-          if(x<minX)minX=x; if(x>maxX)maxX=x; if(y<minY)minY=y; if(y>maxY)maxY=y; cnt++;
-        }
-        if(cnt>0) res.push({x:minX,y:minY,w:maxX-minX,h:maxY-minY});
+  // gray: 扁平灰度数组；返回降采样坐标系运动框，无运动返回 []
+  detect(gray,gw,gh){
+    if(this.prev===null || this.prev.length!==gray.length){
+      this.prev=gray;   // gray 每帧新建，可直接持有
+      return [];
+    }
+    let cnt=0,minX=gw,maxX=0,minY=gh,maxY=0;
+    for(let i=0;i<gray.length;i++){
+      if(Math.abs(gray[i]-this.prev[i])>CFG.motionThresh){
+        cnt++;
+        const x=i%gw, y=(i/gw)|0;
+        if(x<minX)minX=x; if(x>maxX)maxX=x; if(y<minY)minY=y; if(y>maxY)maxY=y;
       }
     }
     this.prev=gray;
-    return res;
+    if(!cnt || cnt/gw/gh<=CFG.minAreaRatio) return [];
+    return [{x:minX,y:minY,w:maxX-minX,h:maxY-minY}];
   }
-}
-// 简易灰度差
-function cvsub(a,b){
-  return a.map((row,y)=>row.map((v,x)=>Math.abs(v-b[y][x])));
 }
 
 // ---------- 真实无人机检测器（onnxruntime-web 加载 yolov8s-drone.onnx）----------
 // 复用 Python 管线验证过的真实模型：letterbox 预处理 + YOLOv8 NMS 后处理。
 class YoloDroneDetector{
   constructor(){ this.ort=null; this.session=null; this.imgsz=640; this.conf=0.25;
-    this.names={0:'drone'}; this.loaded=false; this.loading=false; }
+    this.names={0:'drone'}; this.loaded=false; this.loading=false;
+    this._off=document.createElement('canvas');   // letterbox 画布复用（每帧新建会拖垮 GC）
+    this._offCtx=this._off.getContext('2d',{willReadFrequently:true}); }
   async load(){
     if(this.loaded||this.loading) return;
     this.loading=true;
@@ -384,8 +395,8 @@ class YoloDroneDetector{
     const r=Math.min(s/srcW, s/srcH);
     const nw=Math.round(srcW*r), nh=Math.round(srcH*r);
     const dw=Math.floor((s-nw)/2), dh=Math.floor((s-nh)/2);
-    const off=document.createElement('canvas'); off.width=nw; off.height=nh;
-    const octx=off.getContext('2d',{willReadFrequently:true});
+    const off=this._off; off.width=nw; off.height=nh;
+    const octx=this._offCtx;
     octx.drawImage(canvas,0,0,nw,nh);
     const img=octx.getImageData(0,0,nw,nh).data;
     // 填充灰底画布 114
@@ -474,6 +485,8 @@ class JepaDiscriminator{
     this.loaded=false; this.loading=false;
     this.probe=null;  // {logreg_w,logreg_b,proto_bird,proto_drone,n_bird,n_drone}
     this.rid=0;       // 在线学习样本计数
+    this._cropCv=document.createElement('canvas');  // crop 画布复用
+    this._cropCtx=this._cropCv.getContext('2d',{willReadFrequently:true});
   }
   async load(){
     if(this.loaded||this.loading) return this.loaded;
@@ -506,8 +519,8 @@ class JepaDiscriminator{
   }
   // 从图像 canvas 中裁剪出 bbox 区域并缩放到 224
   _crop(canvas, bx, by, bw, bh){
-    const c=document.createElement('canvas'); c.width=this.imgsz; c.height=this.imgsz;
-    const ctx=c.getContext('2d',{willReadFrequently:true});
+    const c=this._cropCv; c.width=this.imgsz; c.height=this.imgsz;
+    const ctx=this._cropCtx;
     const pad=0.15, nw=bw*(1+2*pad), nh=bh*(1+2*pad);
     const sx=Math.max(0,bx-bw*pad), sy=Math.max(0,by-bh*pad);
     const sw=Math.min(canvas.width-sx,nw), sh=Math.min(canvas.height-sy,nh);
@@ -553,8 +566,9 @@ class JepaDiscriminator{
     for(let i=0;i<feat.length;i++){ db+=(feat[i]-p.proto_bird[i])**2; dd+=(feat[i]-p.proto_drone[i])**2; }
     return {bird:Math.sqrt(db), drone:Math.sqrt(dd)};
   }
-  // 在线后训练：用户反馈(0=bird,1=drone) 增量更新质心 + 岭回归
-  // 岭回归闭式解维护累积 Gram 矩阵(近似,轻量) + 增量梯度一阶
+  // 在线后训练：用户反馈(0=bird,1=drone)
+  // 质心增量更新 + 对 logreg 头做单步 SGD 小步长更新
+  // （logreg_w 为 768 维，维护完整 Gram 矩阵的闭式解在 wasm 端代价过高，取轻量折中）
   feedback(feat, label){
     const p=this.probe;
     if(label===0){ p.proto_bird=weightedAvg(p.proto_bird,feat,p.n_bird); p.n_bird++; }
@@ -591,9 +605,11 @@ let srcCanvas=document.createElement('canvas');
 let sctx=srcCanvas.getContext('2d');
 let zoom=1, zoomTarget=1, modeFollow=true;
 let tracker=new Tracker();
+let motionGate=new MotionGate();
 let detector=new YoloDroneDetector();
 let jepa=new JepaDiscriminator();   // JEPA 特征判别 + 在线后训练
-let lastDet=0,lastPatrol=0,lastConfT=0;
+let lastDet=0;
+let detecting=false;                // 慢系统在飞标志：wasm 推理期间 raf 重入不重复派发
 let frameCount=0, flip=false;
 let pendingFeedback=null;  // 待反馈目标特征 {feat,label} -> 触发在线学习
 let pendingJepa=null;      // 最近一次 JEPA 判别结果(供 HUD 显示)
@@ -670,7 +686,6 @@ document.getElementById('hkModeHls').onclick=()=>setHikMode('hls');
 function stopNetSource(){
   if(whep){ try{whep.close();}catch(e){} whep=null; }
   if(hls){ try{hls.destroy();}catch(e){} hls=null; }
-  if(video.srcObject===null||video.src.startsWith('blob:')){} // 保留相机/文件流
   video.src=''; video.srcObject=null;
 }
 // WHEP 连接（主，低延迟）
@@ -800,7 +815,9 @@ function startLoop(){
   loop();
 }
 
-const DS=96; // 检测降采样宽度
+const DS=96; // 检测降采样宽度(快系统)
+const grayCv=document.createElement('canvas');  // 门控画布复用（每帧新建会拖垮 GC）
+const grayCtx=grayCv.getContext('2d',{willReadFrequently:true});
 async function loop(){
   if(!running) return;
   raf=requestAnimationFrame(loop);
@@ -817,60 +834,68 @@ async function loop(){
   smZoom+=(zoomTarget-smZoom)*0.25;
   zoom=smZoom;
 
-  // 降采样灰度(快系统门控)
+  // 快系统：降采样灰度 + 帧差门控（逐帧、廉价，不触发任何重活）
   const gw=DS, gh=Math.max(1,Math.round(DS*vh/vw));
-  const gcv=document.createElement('canvas'); gcv.width=gw; gcv.height=gh;
-  const gctx=gcv.getContext('2d'); gctx.drawImage(srcCanvas,0,0,gw,gh);
-  const {data}=gctx.getImageData(0,0,gw,gh);
-  const gray=[]; for(let y=0;y<gh;y++){gray[y]=[];for(let x=0;x<gw;x++)gray[y][x]=data[(y*gw+x)*4];}
+  if(grayCv.width!==gw||grayCv.height!==gh){ grayCv.width=gw; grayCv.height=gh; }
+  grayCtx.drawImage(srcCanvas,0,0,gw,gh);
+  const gdata=grayCtx.getImageData(0,0,gw,gh).data;
+  const gray=new Uint8Array(gw*gh);
+  for(let i=0;i<gray.length;i++) gray[i]=gdata[i*4];
+  const motion=motionGate.detect(gray,gw,gh);
   const t1=performance.now();
 
-  // 触发式检测(冷却/巡检)
+  // 慢系统：触发式检测——有运动即检（间隔≥motionDetInterval），无运动按巡检间隔兜底
   const now=performance.now();
   let dets=[];
-  const hasTarget=tracker.tracks.size>0;
-  const cooldown=hasTarget?CFG.targetCooldown:CFG.patrolInterval;
-  if(now-lastDet>=cooldown){
-    const t2=performance.now();
-    // 真实模型推理（onnxruntime-web）
-    const raw=await detector.predict(srcCanvas).catch(e=>{ tele.err('推理失败:'+e.message); return []; });
-    const t3=performance.now();
-    // 转换：原图像素 → 归一化坐标 + 距离 + 变焦
-    dets=raw.map(d=>{
-      const b=d.bbox;
-      const bx=b[0]/vw, by=b[1]/vh, bw=b[2]/vw, bh=b[3]/vh;
-      return {cls:d.cls,conf:d.conf,bbox:[bx,by,bw,bh],cx:bx+bw/2,cy:by+bh/2,w:bw,h:bh,
-        dist:estimateDist(b[3],vh,zoom),zoom};
-    });
-    // JEPA 判别：对最高置信度目标提取特征并分类(鸟/无人机)，结果叠加到遥测
-    if(dets.length && jepa.loaded){
-      const top=dets[0];
-      try{
-        const bx=top.bbox[0]*vw, by=top.bbox[1]*vh, bw=top.bbox[2]*vw, bh=top.bbox[3]*vh;
-        const feat=await jepa.features(srcCanvas, bx,by,bw,bh);
-        const jp=jepa.predict(feat);
-        top.jp=jp; pendingJepa=jp;
-        top.feat=feat;   // 供反馈按钮做在线后训练
-        pendingFeedback=feat;
-        tele._log({ty:'det',cls:jp.label,conf:Math.round(jp.droneScore*1000)/1000,
-          bird:Math.round(jp.birdScore*1000)/1000,dist:top.dist,zoom});
-      }catch(e){ tele.err('JEPA 判别失败:'+e.message); }
-    }
-    // 跟踪
-    const t4=performance.now();
-    tracker.update(dets,now);
-    lastDet=now;
-    // 确认事件
-    for(const t of tracker.tracks.values()){
-      if(t.confirmed && now-lastConfT>CFG.confirmWindow){
-        tele.conf({id:t.id,dist:estimateDist(t.box.h*vh,vh,zoom)});
-        toast('⚠ 已确认无人机 #'+t.id); lastConfT=now;
+  const due = motion.length>0
+    ? now-lastDet>=CFG.motionDetInterval
+    : now-lastDet>=CFG.patrolInterval;
+  if(due && !detecting){
+    detecting=true;
+    try{
+      const t2=performance.now();
+      const raw=await detector.predict(srcCanvas).catch(e=>{ tele.err('推理失败:'+e.message); return []; });
+      const t3=performance.now();
+      // 转换：原图像素 → 归一化坐标 + 距离 + 变焦（bbox 统一 [x,y,w,h] 数组）
+      dets=raw.map(d=>{
+        const b=d.bbox;
+        const bx=b[0]/vw, by=b[1]/vh, bw=b[2]/vw, bh=b[3]/vh;
+        return {cls:d.cls,conf:d.conf,bbox:[bx,by,bw,bh],cx:bx+bw/2,cy:by+bh/2,
+          dist:estimateDist(b[3],vh),zoom};
+      });
+      // JEPA 判别：对最高置信度目标提取特征并分类(鸟/无人机)，结果叠加到遥测
+      if(dets.length && jepa.loaded){
+        const top=dets[0];
+        try{
+          const bx=top.bbox[0]*vw, by=top.bbox[1]*vh, bw=top.bbox[2]*vw, bh=top.bbox[3]*vh;
+          const feat=await jepa.features(srcCanvas, bx,by,bw,bh);
+          const jp=jepa.predict(feat);
+          top.jp=jp; pendingJepa=jp;
+          top.feat=feat;   // 供反馈按钮做在线后训练
+          pendingFeedback=feat;
+          tele._log({ty:'det',cls:jp.label,conf:Math.round(jp.droneScore*1000)/1000,
+            bird:Math.round(jp.birdScore*1000)/1000,dist:top.dist,zoom});
+        }catch(e){ tele.err('JEPA 判别失败:'+e.message); }
       }
+      // 跟踪
+      const t4=performance.now();
+      tracker.update(dets,now);
+      lastDet=now;
+      // 确认事件：每个目标首次确认立即告警，此后按 reconfirmInterval 重复
+      for(const t of tracker.tracks.values()){
+        if(t.confirmed && (t.lastConfirmAt===undefined ||
+                           now-t.lastConfirmAt>=CFG.reconfirmInterval)){
+          tele.conf({id:t.id,dist:estimateDist(t.box[3]*vh,vh)});
+          toast('⚠ 已确认无人机 #'+t.id); t.lastConfirmAt=now;
+        }
+      }
+      const t5=performance.now();
+      if(dets.length) tele.det(dets[0]);
+      tele.perf(frameCount,video.currentTime,frameCount?1000/(performance.now()-t1):0,
+        t1-t0,t3-t2,t5-t4,t5-t0,zoom,dets.length,tracker.getConfirmed().length);
+    }finally{
+      detecting=false;
     }
-    const t5=performance.now();
-    if(dets.length) tele.det(dets[0]);
-    tele.perf(frameCount,video.currentTime,frameCount?1000/(performance.now()-t1):0,
-      t1-t0,t3-t2,t5-t4,t5-t0,zoom,dets.length,tracker.getConfirmed().length);
   }
   frameCount++;
 
@@ -899,19 +924,17 @@ function drawOverlay(vw,vh,t0){
   octx.save();
   octx.beginPath(); octx.rect(0,0,overlay.width,overlay.height); octx.clip();
   octx.drawImage(srcCanvas,sx,sy,zw,zh, ox,oy, ow,oh);
-  octx.fillStyle='rgba(0,0,0,.55)'; octx.fillRect(ox,oy,ow,oh);
-  octx.drawImage(srcCanvas,sx,sy,zw,zh, ox,oy, ow,oh); // 再画一次(模拟门控调光)
   octx.restore();
 
   // 检测框(映射到视口坐标)，直接绘制到 overlay canvas（canvas 无法承载子元素）
   octx.lineWidth=2;
   for(const t of tracker.tracks.values()){
-    const bx=t.box.x*ow, by=t.box.y*oh, bw=t.box.w*ow, bh=t.box.h*oh;
+    const bx=t.box[0]*ow, by=t.box[1]*oh, bw=t.box[2]*ow, bh=t.box[3]*oh;
     // 视口偏移(变焦中心)
     const vx=bx - (sx/vw)*ow, vy=by - (sy/vh)*oh;
     if(vx+ox<0||vy+oy<0||vx>ow||vy>oh) continue;
     const px=ox+vx, py=oy+vy;
-    const d=estimateDist(t.box.h*vh,vh,zoom);
+    const d=estimateDist(t.box[3]*vh,vh);
     octx.strokeStyle=t.confirmed?'#ff5d5d':'#35e0a1';
     octx.strokeRect(px,py,bw,bh);
     // 标签

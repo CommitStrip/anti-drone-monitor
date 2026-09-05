@@ -128,6 +128,12 @@ struct Index {
           methodList: ['pushTelemetry'],
           controller: this.controller
         })
+        // ArkWeb 默认拒绝网页 getUserMedia：不显式授权则相机画面黑屏
+        // （应用级 CAMERA 权限已在 EntryAbility.requestPermissionsFromUser 请求）
+        .onPermissionRequest((event) => {
+          const req = event.request;
+          req.grant(req.getAccessibleResource());
+        })
         .darkMode(WebDarkMode.On)
         .domStorageAccess(true)
         .javaScriptAccess(true)

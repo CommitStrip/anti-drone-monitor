@@ -52,7 +52,16 @@ class MainActivity : AppCompatActivity() {
             allowFileAccess = true
             setSupportZoom(false)
         }
-        webView.webChromeClient = WebChromeClient() // getUserMedia 需要
+        webView.webChromeClient = object : WebChromeClient() {
+            // WebView 默认拒绝网页 getUserMedia 请求：不重写此回调相机画面只会黑屏
+            override fun onPermissionRequest(request: PermissionRequest) {
+                if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                    request.grant(request.resources)
+                } else {
+                    request.deny()
+                }
+            }
+        }
         webView.webViewClient = WebViewClient()
 
         // 遥测桥：接收核心的遥测事件并落盘
@@ -80,7 +89,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun openTelemetryLog() {
         val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val f = File(telemetryDir, "telemetry_$ts.csv")
+        // 遥测事件是每行一个 JSON（JSONL），不是 CSV——扩展名据实修正
+        val f = File(telemetryDir, "telemetry_$ts.jsonl")
         telemetryWriter?.close()
         telemetryWriter = f.writer()
     }
