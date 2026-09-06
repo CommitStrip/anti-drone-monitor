@@ -1,76 +1,124 @@
-# 反无人机监控 · 手机端演示程序
+# anti-drone-monitor — Realtime Anti-Drone Monitoring (Phone Demo)
 
-基于已完成的**反无人机识别管线**（帧差门控 → 触发式检测 → IoU 目标跟踪 → 多帧确认 → 目标跟随变焦）构建的**跨端手机演示程序**。
+[![CI](https://github.com/CommitStrip/anti-drone-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/CommitStrip/anti-drone-monitor/actions/workflows/ci.yml)
 
-## 设计：一套 Web 核心，双端复用
+**English** | [简体中文](README-CN.md)
+
+Turn a live video stream (Hikvision RTSP / phone camera / local video) into **on-device realtime drone detection and alerting**: frame-difference motion gating → triggered YOLOv8s detection → constant-velocity tracking + multi-frame confirmation → JEPA (DINOv2) bird/drone discrimination → target-following zoom. One HTML5 core runs on onnxruntime-web (pure wasm, no server-side inference), reused by both an Android WebView shell and a HarmonyOS ArkWeb shell.
+
+Current validation status: probe-head offline accuracy **98.15%** (162 authoritative Drone-vs-Bird samples, evidence `web/jepa_probe_init.json`: acc=0.9815, n_train=162, dim=768); WHEP signaling verified end-to-end against a local MediaMTX v1.20.0 + H.264 test stream; **21 unit tests + GitHub Actions CI all green**. On-device end-to-end fps/latency benchmarks are **pending** — per-frame telemetry is already built in (see [Performance & validation status](#performance--validation-status)).
+
+## Key capabilities
+
+| Capability | Description |
+|------|------|
+| Realtime detection | Frame-difference gate (fast) → triggered detection (slow): motion fires detection within 400 ms, a 5 s patrol covers stillness; motion-area floor 0.003 suppresses sensor noise |
+| Target tracking | IoU + center-distance association + constant-velocity prediction (no track loss across long detection gaps), multi-frame confirmation (≥2) cuts false positives; confirmed targets get a 12 s survival window — hovering targets are not lost |
+| Smooth zoom | Pinch / slider / buttons + **target-following** auto-centering, smooth interpolation 1×-8× |
+| Distance estimation | Pinhole model with per-class size (drone 0.35 m / bird 0.20 m); digital zoom is a center crop and does not affect the reading |
+| Performance recording | Per-frame fps / stage latencies / gate motion ratio / detection events / confirmation events / zoom level |
+| Effect recording | Detected class / confidence / distance, confirmation-alert timeline |
+| Data traceability | IndexedDB persistence + CSV/JSON export + native bridge (Android JSONL / Harmony CSV) |
+
+## System layout
 
 ```
 drone-monitor-app/
-├── web/index.html        # 共享 HTML5 核心（两端 WebView 复用）
-├── web/core.js           # 纯逻辑核心（配置/跟踪/门控，node:test 可单测）
-├── android/              # Android 工程（Kotlin WebView 封装 + 遥测落盘）
-└── harmony/              # HarmonyOS(NEXT) 工程（ArkWeb 封装 + 遥测落盘）
+├── web/index.html        # shared HTML5 core (reused by both WebViews)
+├── web/core.js           # pure-logic core (config/tracking/gating; node:test-able)
+├── gateway/              # MediaMTX gateway: Hikvision RTSP → WebRTC(WHEP)/HLS
+├── android/              # Android app (Kotlin WebView shell + telemetry)
+└── harmony/              # HarmonyOS(NEXT) app (ArkWeb shell + telemetry)
 ```
 
-> 修改 `web/` 下共享文件后，运行 `bash scripts/sync-web.sh` 同步 android/harmony 打包副本；CI 用 `--check` 强制校验三副本一致性。单测：`node --test`（node:test，零依赖）。
+> After editing shared files under `web/`, run `bash scripts/sync-web.sh` to sync the android/harmony packaged copies; CI enforces consistency with `--check`.
 
-手机作为平台的优势：**变焦更丝滑**（支持捏合手势 + 滑块 + 目标跟随数字变焦，平滑插值过渡），同时**运行时全量记录性能与效果**便于追溯与后期改进。
+## How it works
 
-## 核心能力
+The fast system runs frame differencing every frame on a 96×54 downscaled grayscale image (threshold 25, area floor 0.003 ≈ 15 px) — **motion fires detection within 400 ms; stillness falls back to a 5 s patrol**. The slow system runs YOLOv8s on triggered frames (640 letterbox → class-wise NMS); detections are matched by IoU + center distance (constant-velocity prediction bridges the 0.4–5 s detection gaps, a 0.35 normalized matching gate prevents distant targets from being swallowed), confirmed after 2 consecutive frames — hovering targets stay alive via the patrol (confirmed tracks survive 12 s) instead of being reset by aging. Detection always runs on the full frame; digital zoom is only a center crop of the overlay and does not affect detection or ranging.
 
-| 能力 | 说明 |
-|------|------|
-| 实时检测 | 帧差运动门控(快) → 触发式检测(慢)：有运动 400ms 即检、无运动 5s 巡检兜底，运动面积门槛 0.003 抗传感器噪声 |
-| 目标跟踪 | IoU + 中心距离关联 + 恒速预测（大检测间隔不丢轨迹），多帧确认(≥2 次)降假阳性；已确认目标 12s 存活窗，悬停不丢 |
-| 丝滑变焦 | 捏合/滑块/按钮 + **目标跟随**自动居中，平滑插值 1×-8× |
-| 距离估算 | 针孔模型按类别尺寸粗估（无人机 0.35m / 鸟 0.20m）；数字变焦是中心裁剪，不影响读数 |
-| 性能记录 | 每帧 fps / 各阶段延迟 / 门控运动占比 / 检出事件 / 确认事件 / 变焦档位 |
-| 效果记录 | 检出目标类别/置信度/距离，确认告警时间线 |
-| 数据可追溯 | IndexedDB 落盘 + CSV/JSON 导出 + 原生桥接落盘 |
+## Real model inference (integrated)
 
-## 真实模型推理（已接入）
+The core ships a real **YOLOv8s drone-detection model** (`web/yolov8s-drone.onnx`, 43 MB, onnxruntime-web + wasm), replacing the earlier synthetic `MotionDetector`. Full chain: letterbox preprocessing → inference → box/class parsing → class-wise NMS → IoU tracking & confirmation → target-following zoom. Inference time and detections stream into telemetry; wasm threads adapt to `SharedArrayBuffer` availability (single-threaded under WebView file://).
 
-核心已内置真实 **YOLOv8s 无人机检测模型**（`web/yolov8s-drone.onnx`，onnxruntime-web + wasm 单核），替换掉了先前的合成 `MotionDetector`。完整链路：letterbox 预处理 → 模型推理 → 坐标/类别解析 → 类内 NMS → IoU 跟踪确认 → 目标跟随变焦。模型推理耗时与检出结果实时写入遥测。
+## JEPA discrimination + online learning (integrated)
 
-## JEPA 判别 + 在线后训练（已接入）
+On top of YOLO localization, a **JEPA-style self-supervised discriminator** (`web/dinov2_vits14_feat.onnx`, 85 MB, DINOv2-ViT-S feature extractor + `web/jepa_probe_init.json` linear probe head):
 
-在 YOLO 定位之上叠加 **JEPA 风格自监督判别**（`web/dinov2_vits14_feat.onnx`，DINOv2-ViT-S 特征提取器 + `web/jepa_probe_init.json` 线性探针头）：
+- **Division of labor**: YOLO localizes (candidate boxes), DINOv2 discriminates (768-d features per crop → probe head → bird/drone confidence on the HUD).
+- **JEPA post-training**: onnxruntime-web supports inference only and cannot fine-tune the backbone, so "post-training" lands as **online lifelong learning** — on frozen DINOv2 features, user feedback ("🕊 bird / 🛸 drone") incrementally updates the probe head (centroid moving average + one-step SGD on the logreg head), persisted to `localStorage` (survives restarts). Feedback is bound to a target with a 15 s validity window to prevent mislabeling. "Reset learning" restores the initial weights.
+- Probe-head offline accuracy **98.15%** (162 authoritative Drone-vs-Bird samples; evidence in-repo at `web/jepa_probe_init.json`: acc=0.9815, n_train=162, dim=768).
 
-- **分工**：YOLO 负责定位（检测候选框），DINOv2 负责判别（对候选框 crop 提 768 维特征，经探针头输出"鸟/无人机"置信度并在 HUD 显示）。
-- **JEPA 后训练**：onnxruntime-web 仅支持推理、无法微调 backbone，故"后训练"落地为**在线终身学习**——在冻结的 DINOv2 特征上，用户点"🕊 这是鸟 / 🛸 这是无人机"反馈后，用增量更新（质心滑动平均 + logreg 头单步 SGD）微调探针头，并持久化到 `localStorage`（重启保留）。"重置学习"可恢复初始化权重。反馈带目标绑定与 15s 时效校验（目标已变化时提示重试），防止打在错误对象上。
-- 初始化探针头离线精度 **98.15%**（162 张权威 Drone-vs-Bird 样本；证据见仓库内 `web/jepa_probe_init.json`：acc=0.9815, n_train=162, dim=768）。
+> Note: the DINOv2 model is ~85 MB; it is **lazy-loaded** — nothing is loaded at startup, the model is fetched on first confirmed target (HUD shows load…); discrimination runs only on **multi-frame-confirmed targets** (immediately on first confirmation, then refreshed every 30 s — not per frame, not per detection) to bound wasm-side inference cost.
 
-> 注意：DINOv2 模型约 85 MB；**懒加载**——开场不加载，首次确认目标时才拉起（HUD 显示 load…）；判别只对**多帧确认后的目标**触发（首次确认立即判别，此后每 30s 刷新一次，非每帧/非每次检出），以控制 wasm 端侧推理开销。
+## Hikvision RTSP intake (verified)
 
-## 海康威视监控接入（已接入）
+Feed a real Hikvision camera's RTSP stream into the app for live detection/discrimination. Browsers cannot play RTSP directly, so a local **MediaMTX gateway** (`gateway/`) converts it into low-latency WebRTC (WHEP) and highly compatible HLS:
 
-把真实海康摄像头的 RTSP 流接入本 App 做实时检测/判别。浏览器无法直接播放 RTSP，故经由本地 **MediaMTX 网关**（`gateway/`）转成低延迟 WebRTC(WHEP) 与高兼容 HLS 两种协议：
+- **Division of labor**: MediaMTX pulls the Hikvision RTSP stream (camera IP/credentials in `gateway/mediamtx.yml`) → WebRTC/WHEP (8889) or HLS (8888); the app's `whep-client.js` implements standard WHEP signaling (exponential-backoff reconnect: 2 s start, 30 s cap) and falls back to `hls.min.js` HLS on failure.
+- **How to connect**: tap "🔌 海康" in the app, enter the gateway address and stream path (e.g. `http://gatewayIP:8889` + `cam1`), pick WebRTC low-latency or HLS compatible — the same YOLO+JEPA pipeline runs on top.
+- **Hikvision RTSP URLs**: main stream `rtsp://user:pass@IP:554/Streaming/Channels/101`, sub-stream `.../102`; the main stream (1080p H.264) is recommended for detection; H.265 cameras need transcoding (see `gateway/README.md`).
+- Verified end-to-end with local MediaMTX v1.20.0 + an H.264 test stream (**full WHEP signaling**: OPTIONS→POST→PATCH→DELETE all pass).
 
-- **分工**：MediaMTX 拉海康 RTSP（`gateway/mediamtx.yml` 配置相机 IP/账号）→ WebRTC/WHEP(8889) 或 HLS(8888)；App 端 `whep-client.js` 实现标准 WHEP 信令拉流，失败自动回退 `hls.min.js` 的 HLS。
-- **接入方式**：App 点"🔌 海康"填网关地址与流路径（如 `http://网关IP:8889` + `cam1`），选 WebRTC 低延迟或 HLS 兼容，连接后复用同一套 YOLO+JEPA 检测管线。
-- **海康 RTSP 地址**：主码流 `rtsp://用户:密码@IP:554/Streaming/Channels/101`，子码流 `.../102`；建议主码流（1080p H.264）检测，H.265 相机需转码（见 `gateway/README.md`）。
-- 已用本地 MediaMTX v1.20.0 + H.264 测试流完成 **WHEP 信令端到端验证**（OPTIONS→POST→PATCH→DELETE 全通过）。
+Gateway startup and configuration: see `gateway/README.md`.
 
-网关启动与配置：见 `gateway/README.md`。
-
-## 快速体验（浏览器/手机）
+## Quick start (browser / phone)
 
 ```bash
 cd web && python3 -m http.server 8899
-# 手机同网段访问 http://<电脑IP>:8899/index.html
-# 或直接浏览器打开 web/index.html
+# on a phone in the same network, open http://<PC-IP>:8899/index.html
+# or open web/index.html directly in a browser
 ```
 
-- 点击 **开始监控** 调用手机相机；或 **📁 视频** 载入本地视频回放。
-- 点击 **记录** 打开遥测面板，运行中实时累积事件；**导出 CSV/JSON** 下载记录。
-- 变焦滑杆 / ＋－按钮 / 双指捏合直接操作；开启 **目标跟随** 变焦自动锁住已确认目标。
+- Tap **▶ Start** to use the phone camera, or **📁 Video** to load a local video.
+- Tap **⏺ Record** to open the telemetry panel; events accumulate live; **export CSV/JSON** to download.
+- Zoom via slider / ＋− buttons / two-finger pinch; enable **target-following** to auto-center on confirmed targets.
 
-## Android 端
+## Native shells
 
-见 `android/README.md`。核心用 WebView 加载共享 `index.html`，`JsBridge` 把遥测写入应用私有目录便于追溯。
+### Android
 
-## 鸿蒙端
+See `android/README.md`. The core runs in a WebView loading the shared `index.html`; a `JsBridge` writes telemetry as JSONL into app-private storage; the camera is granted explicitly via `WebChromeClient.onPermissionRequest` (WebView rejects getUserMedia by default).
 
-见 `harmony/README.md`。核心用 ArkWeb 组件加载，`javaScriptProxy` 把遥测写入沙箱文件。
+### HarmonyOS
 
-> 说明：本工程为**可运行的真实推理核心 + 双端原生壳**。`web/` 核心可独立运行于任意手机浏览器验证全部功能（真机摄像头输出 H.264 可正常播放）；两端原生壳在此沙箱内未编译（无对应 SDK），需在 Android Studio / DevEco Studio 中构建安装。遥测落盘路径见 `android/README.md` 与 `harmony/README.md`。
+See `harmony/README.md`. The core runs in an ArkWeb component; `javaScriptProxy` writes telemetry to sandboxed CSV; the camera is granted via `onPermissionRequest` plus a runtime `ohos.permission.CAMERA` request in `EntryAbility`.
+
+> Note: this project is a **runnable real-inference core + two native shells**. The `web/` core runs standalone in any phone browser and exercises every feature; the native shells must be built in Android Studio / DevEco Studio (no build artifacts are shipped in the repo).
+
+## Development: tests, CI and multi-copy sync
+
+```bash
+node --test tests/core.test.mjs     # 21 unit tests (node:test, zero deps)
+bash scripts/sync-web.sh            # web/ → android assets + harmony rawfile
+bash scripts/sync-web.sh --check    # consistency check only (same as CI)
+```
+
+CI (node 20/22 matrix): JS syntax checks → unit tests → three-copy consistency. All pure logic (config/IoU/tracker/gate/ranging) lives in `web/core.js` with zero DOM dependencies, directly unit-testable; the `index.html` inline script has a syntax-guard test.
+
+## Performance & validation status
+
+| Item | Status |
+|----|------|
+| WHEP signaling end-to-end | ✅ verified (MediaMTX v1.20.0 + H.264 test stream, OPTIONS→POST→PATCH→DELETE all pass) |
+| Probe-head offline accuracy | ✅ 98.15% (162 samples, `web/jepa_probe_init.json`) |
+| Unit tests / CI | ✅ 21 tests green, node 20/22 matrix |
+| On-device fps/latency | ⏳ pending — telemetry already records per-frame `detMs/trackMs/motionRatio`; export CSV/JSON for measured data |
+
+Model size & strategy: YOLOv8s fp32 43 MB + DINOv2 85 MB; a single wasm-side inference takes seconds — hence detection is **trigger-based** (gating + cooldown) rather than per-frame, and JEPA runs only on confirmed targets with lazy loading. The next fps lever is swapping in quantized lightweight weights (todo).
+
+## Platforms & hardware
+
+Browsers need WASM and WebRTC (Android 8+ WebView / modern desktop browsers); the HarmonyOS shell needs HarmonyOS NEXT + ArkWeb. No GPU dependency — all inference is wasm CPU.
+
+## Acknowledgments
+
+- [MediaMTX](https://github.com/bluenviron/mediamtx) — RTSP → WebRTC/HLS streaming gateway (MIT). This repo only ships configuration and a launch script under `gateway/`.
+- [onnxruntime-web](https://github.com/microsoft/onnxruntime) — wasm inference engine (MIT).
+- [hls.js](https://github.com/video-dev/hls.js) — HLS fallback playback (Apache-2.0).
+- [DINOv2](https://github.com/facebookresearch/dinov2) ViT-S/14 (Meta AI) — discrimination feature extractor; upstream code is Apache-2.0 while the official weights are CC-BY-NC 4.0 (non-commercial). `dinov2_vits14_feat.onnx` in this repo is an export of its vision tower; verify upstream terms before redistribution or commercial use.
+- [YOLOv8 / ultralytics](https://github.com/ultralytics/ultralytics) — detection architecture (AGPL-3.0). `yolov8s-drone.onnx` in this repo is a fine-tuned drone-detection export of that architecture; redistribution and commercial use must comply with AGPL-3.0 and upstream terms.
+
+## License
+
+MIT © 2026 (applies to the repository code; the bundled model weights `*.onnx` follow their upstream licenses — see Acknowledgments)
