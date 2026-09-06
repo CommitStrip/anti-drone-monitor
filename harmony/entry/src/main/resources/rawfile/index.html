@@ -273,25 +273,39 @@ class YoloDroneDetector{
     this._off=document.createElement('canvas');   // letterbox 画布复用（每帧新建会拖垮 GC）
     this._offCtx=this._off.getContext('2d',{willReadFrequently:true}); }
   async load(){
-    if(this.loaded||this.loading) return;
-    this.loading=true;
+    // 可等待的加载：并发调用共享同一个 promise（此前 loading 时直接 return，
+    // 调用方在 session 尚未就绪时继续执行，首检必崩）
+    if(this.loaded) return true;
+    if(!this._loadPromise){
+      this.loading=true;
+      this._loadPromise=(async()=>{
+        try{
+          // onnxruntime-web 已通过 <script> 挂载到 window.ort（UMD）
+          this.ort=window.ort || globalThis.ort;
+          if(!this.ort) throw new Error('onnxruntime-web 未加载');
+          const wasmDir='.';
+          this.ort.env.wasm.wasmPaths=wasmDir+'/';
+          // 多线程 wasm 需要 SharedArrayBuffer（跨域隔离）；WebView file:// 下不可用，自动回退 1 线程
+          this.ort.env.wasm.numThreads =
+            (typeof SharedArrayBuffer!=='undefined')
+              ? Math.min(4, navigator.hardwareConcurrency||1) : 1;
+          this.session = await this.ort.InferenceSession.create('./yolov8s-drone.onnx',{
+            executionProviders:['wasm'],
+            graphOptimizationLevel:'all'
+          });
+          this.loaded=true;
+          return true;
+        }finally{
+          this.loading=false;
+        }
+      })();
+    }
     try{
-      // onnxruntime-web 已通过 <script> 挂载到 window.ort（UMD）
-      this.ort=window.ort || globalThis.ort;
-      if(!this.ort) throw new Error('onnxruntime-web 未加载');
-      const wasmDir='.';
-      this.ort.env.wasm.wasmPaths=wasmDir+'/';
-      // 多线程 wasm 需要 SharedArrayBuffer（跨域隔离）；WebView file:// 下不可用，自动回退 1 线程
-      this.ort.env.wasm.numThreads =
-        (typeof SharedArrayBuffer!=='undefined')
-          ? Math.min(4, navigator.hardwareConcurrency||1) : 1;
-      this.session = await this.ort.InferenceSession.create('./yolov8s-drone.onnx',{
-        executionProviders:['wasm'],
-        graphOptimizationLevel:'all'
-      });
-      this.loaded=true; this.loading=false;
-      return true;
-    }catch(e){ this.loading=false; throw e; }
+      return await this._loadPromise;
+    }catch(e){
+      this._loadPromise=null;  // 失败允许重试
+      throw e;
+    }
   }
   // letterbox 预处理：返回 normalized tensor array
   _preprocess(canvas){
@@ -394,22 +408,36 @@ class JepaDiscriminator{
     this._cropCtx=this._cropCv.getContext('2d',{willReadFrequently:true});
   }
   async load(){
-    if(this.loaded||this.loading) return this.loaded;
-    this.loading=true;
+    // 与 YoloDroneDetector 同款可等待加载（此前 loading 时返回 false，
+    // features() 会在 session 为 null 时继续执行）
+    if(this.loaded) return true;
+    if(!this._loadPromise){
+      this.loading=true;
+      this._loadPromise=(async()=>{
+        try{
+          this.ort=window.ort||globalThis.ort;
+          if(!this.ort) throw new Error('onnxruntime-web 未加载');
+          this.ort.env.wasm.wasmPaths='./';
+          this.ort.env.wasm.numThreads =
+            (typeof SharedArrayBuffer!=='undefined')
+              ? Math.min(4, navigator.hardwareConcurrency||1) : 1;
+          this.session=await this.ort.InferenceSession.create('./dinov2_vits14_feat.onnx',{
+            executionProviders:['wasm'], graphOptimizationLevel:'all'});
+          // 加载探针头（优先本地持久化的已学习探针，否则用初始化权重）
+          await this.loadProbe();
+          this.loaded=true;
+          return true;
+        }finally{
+          this.loading=false;
+        }
+      })();
+    }
     try{
-      this.ort=window.ort||globalThis.ort;
-      if(!this.ort) throw new Error('onnxruntime-web 未加载');
-      this.ort.env.wasm.wasmPaths='./';
-      this.ort.env.wasm.numThreads =
-        (typeof SharedArrayBuffer!=='undefined')
-          ? Math.min(4, navigator.hardwareConcurrency||1) : 1;
-      this.session=await this.ort.InferenceSession.create('./dinov2_vits14_feat.onnx',{
-        executionProviders:['wasm'], graphOptimizationLevel:'all'});
-      // 加载探针头（优先本地持久化的已学习探针，否则用初始化权重）
-      await this.loadProbe();
-      this.loaded=true; this.loading=false;
-      return true;
-    }catch(e){ this.loading=false; throw e; }
+      return await this._loadPromise;
+    }catch(e){
+      this._loadPromise=null;  // 失败允许重试
+      throw e;
+    }
   }
   // 加载/持久化探针头
   async loadProbe(){
@@ -473,20 +501,21 @@ class JepaDiscriminator{
     for(let i=0;i<feat.length;i++){ db+=(feat[i]-p.proto_bird[i])**2; dd+=(feat[i]-p.proto_drone[i])**2; }
     return {bird:Math.sqrt(db), drone:Math.sqrt(dd)};
   }
-  // 在线后训练：用户反馈(0=bird,1=drone)
-  // 质心增量更新 + 对 logreg 头做单步 SGD 小步长更新
+// 在线后训练：用户反馈(0=bird,1=drone)
+  // 质心增量更新 + 对 logreg 头做单步 SGD（梯度下降，见下）
   // （logreg_w 为 768 维，维护完整 Gram 矩阵的闭式解在 wasm 端代价过高，取轻量折中）
   feedback(feat, label){
     const p=this.probe;
     if(label===0){ p.proto_bird=weightedAvg(p.proto_bird,feat,p.n_bird); p.n_bird++; }
     else { p.proto_drone=weightedAvg(p.proto_drone,feat,p.n_drone); p.n_drone++; }
     // 岭回归增量(在线梯度, 小步长) 更新 logreg_w/b
+    // logreg 头单步 SGD：交叉熵对 logit 的梯度是 (p-y)·x，必须做梯度**下降**
+    // （此前误用 += 做梯度上升，用户反馈越多模型越往反方向走）
     const yhat=this.predict(feat);
-    const err=yhat.droneScore-label;   // 对 drone 类的误差
+    const err=yhat.droneScore-label;   // err = p - y
     const lr=0.05;
-    const gradW=err*feat, gradB=err;
-    for(let i=0;i<feat.length;i++) p.logreg_w[i]+=lr*gradW[i];
-    p.logreg_b+=lr*gradB;
+    for(let i=0;i<feat.length;i++) p.logreg_w[i]-=lr*err*feat[i];
+    p.logreg_b-=lr*err;
     this.rid++;
     this.saveProbe();
     return p.n_bird+p.n_drone;
@@ -546,10 +575,11 @@ document.getElementById('modeManual').onclick=()=>{modeFollow=false;
   document.getElementById('modeManual').classList.add('on');
   document.getElementById('modeFollow').classList.remove('on'); toast('手动变焦');};
 
-// 捏合变焦
-let pinchD=0;
-stage.addEventListener('touchstart',e=>{ if(e.touches.length===2){ pinchD=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);} },{passive:true});
-stage.addEventListener('touchmove',e=>{ if(e.touches.length===2){ e.preventDefault(); const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY); if(pinchD>0) setZoom(zoomTarget*(d/pinchD)*0.5+zoomTarget*0.5); } },{passive:false});
+// 捏合变焦：记住起手时的 zoom 与指距，按"初始zoom × 当前距/起始距"缩放
+// （此前每个 touchmove 都用已更新的 zoomTarget 再乘比例，手指停在 2 倍距离时会持续放大失控）
+let pinchD=0, pinchStartZoom=1;
+stage.addEventListener('touchstart',e=>{ if(e.touches.length===2){ pinchD=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY); pinchStartZoom=zoomTarget; } },{passive:true});
+stage.addEventListener('touchmove',e=>{ if(e.touches.length===2){ e.preventDefault(); const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY); if(pinchD>0) setZoom(pinchStartZoom*d/pinchD); } },{passive:false});
 
 // ---------- 输入源 ----------
 document.getElementById('btnStart').onclick=async()=>{
@@ -595,13 +625,27 @@ function stopNetSource(){
   if(hls){ try{hls.destroy();}catch(e){} hls=null; }
   video.src=''; video.srcObject=null;
 }
-// WHEP 连接（主，低延迟）
-function startWhep(url,user,pass){
-  return new Promise((resolve)=>{
+// WHEP 连接（主，低延迟）：失败必 reject + 超时兜底
+// （此前 Promise 只在 onTrack 才 resolve、onError 只 toast——网关挂起时"连接并
+//  开始监控"会永远卡住，下面的 6s 首帧超时根本走不到）
+function startWhep(url,user,pass,timeoutMs=8000){
+  return new Promise((resolve,reject)=>{
+    let settled=false;
+    const to=setTimeout(()=>{
+      if(settled) return;
+      settled=true;
+      if(whep){ try{whep.close();}catch(e){} whep=null; }
+      reject(new Error('WHEP 连接超时'));
+    }, timeoutMs);
     whep=new WhepClient({
       url, user, pass, video,
-      onTrack:()=>{ resolve(true); },
-      onError:(e)=>{ toast('WHEP: '+e); }
+      onTrack:()=>{ if(!settled){ settled=true; clearTimeout(to); resolve(true); } },
+      onError:(e)=>{
+        if(settled) return;
+        settled=true; clearTimeout(to);
+        if(whep){ try{whep.close();}catch(e2){} whep=null; }
+        reject(new Error(String(e)));
+      }
     });
     whep.start();
   });
@@ -795,18 +839,21 @@ async function loop(){
             top.jp=jp; pendingJepa=jp;
             top.feat=feat;   // 供反馈按钮做在线后训练
             pendingFeedback={feat, trackId: top.trackId, at: now};
-            const trk2=tracker.tracks.get(top.trackId); if(trk2) trk2.lastJepaAt=now;
+            const trk2=tracker.tracks.get(top.trackId);
+            if(trk2){ trk2.lastJepaAt=now; trk2.jp=jp; }  // 判别结果挂到轨迹上（告警语义用）
             tele._log({ty:'det',cls:jp.label,conf:Math.round(jp.droneScore*1000)/1000,
               bird:Math.round(jp.birdScore*1000)/1000,dist:top.dist,zoom});
           }catch(e){ tele.err('JEPA 判别失败:'+e.message); }
         }
       }
       // 确认事件：每个目标首次确认立即告警，此后按 reconfirmInterval 重复
+      // 名称跟随 JEPA 判别（有判别结果时不一律喊无人机）
       for(const t of tracker.tracks.values()){
         if(t.confirmed && (t.lastConfirmAt===undefined ||
                            now-t.lastConfirmAt>=CFG.reconfirmInterval)){
           tele.conf({id:t.id,dist:estimateDist(t.box[3]*vh,vh,t.cls)});
-          toast('⚠ 已确认无人机 #'+t.id); t.lastConfirmAt=now;
+          toast('⚠ 已确认'+((t.jp&&t.jp.label==='bird')?'鸟':'无人机')+' #'+t.id);
+          t.lastConfirmAt=now;
         }
       }
       const t5=performance.now();
