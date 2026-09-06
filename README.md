@@ -105,7 +105,9 @@ CI (node 20/22 matrix): JS syntax checks → unit tests → three-copy consisten
 | Unit tests / CI | ✅ 21 tests green, node 20/22 matrix |
 | On-device fps/latency | ⏳ pending — telemetry already records per-frame `detMs/trackMs/motionRatio`; export CSV/JSON for measured data |
 
-Model size & strategy: YOLOv8s fp32 43 MB + DINOv2 85 MB; a single wasm-side inference takes seconds — hence detection is **trigger-based** (gating + cooldown) rather than per-frame, and JEPA runs only on confirmed targets with lazy loading. The next fps lever is swapping in quantized lightweight weights (todo).
+Model size & strategy: YOLOv8s fp32 43 MB + DINOv2 85 MB; a single wasm-side inference takes seconds — hence detection is **trigger-based** (gating + cooldown) rather than per-frame, and JEPA runs only on confirmed targets with lazy loading.
+
+**int8 quantization — measured verdict (2026-09-06, `scripts/quantize_models.py`)**: the current model is a custom export at opset 12 and is **not quantizable into a working model** — the QOperator path shrinks 42.7→10.9 MB and speeds inference 62→34 ms (1.8×), but post-NMS detections drop 41→0 (outputs collapse to zero). The validation tool ships with a task-level gate (detections must not drop by more than 10%, mean IoU ≥ 0.8) precisely to keep such silent failures out. The real fps lever is re-exporting yolov8n with a modern opset from a training environment via ultralytics (expected to be another order of magnitude smaller/faster); DINOv2 int8 is blocked by the same quantizer operator-compatibility issue and stays fp32 (it only runs on confirmed targets, so its cost is already bounded).
 
 ## Platforms & hardware
 
