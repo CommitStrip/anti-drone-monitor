@@ -19,6 +19,6 @@ jobs:
           node --check web/core.js
           node --check web/whep-client.js
       - name: Unit tests
-        run: node --test tests/
+        run: node --test tests/core.test.mjs
       - name: Packaged copies consistency
         run: bash scripts/sync-web.sh --check
