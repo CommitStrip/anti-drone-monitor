@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const RETRY_MS = 2000;
+  const RETRY_MS = 2000, RETRY_MAX_MS = 30000;
 
   class WhepClient {
     /**
@@ -33,6 +33,7 @@
       this.offerData = null;
       this.closed = false;
       this.retryTimer = null;
+      this.retryMs = RETRY_MS;  // 指数退避当前值（连接成功重置）
     }
 
     start() {
@@ -109,6 +110,7 @@
       };
       this.pc.ontrack = (evt) => {
         if (this.closed) return;
+        this.retryMs = RETRY_MS;  // 连接成功，退避归位
         const stream = evt.streams && evt.streams[0] ? evt.streams[0] : new MediaStream([evt.track]);
         this.conf.video.srcObject = stream;
         if (this.conf.onTrack) this.conf.onTrack(evt);
@@ -171,8 +173,10 @@
       if (this.sessionUrl) { try { fetch(this.sessionUrl, { method: 'DELETE' }); } catch (e2) {} this.sessionUrl = null; }
       if (this.pc) { this.pc.close(); this.pc = null; }
       this.queued = [];
-      this.#err(String(e && e.message ? e.message : e) + '，' + RETRY_MS / 1000 + 's 后重连');
-      this.retryTimer = setTimeout(() => this.#connect(), RETRY_MS);
+      const wait = this.retryMs;
+      this.retryMs = Math.min(RETRY_MAX_MS, this.retryMs * 1.5);  // 指数退避：2s→3s→4.5s…封顶 30s
+      this.#err(String(e && e.message ? e.message : e) + '，' + Math.round(wait / 1000) + 's 后重连');
+      this.retryTimer = setTimeout(() => this.#connect(), wait);
     }
   }
 

@@ -8,6 +8,7 @@
 <script src="./ort.wasm.js"></script>
 <script src="./whep-client.js"></script>
 <script src="./hls.min.js"></script>
+<script src="./core.js"></script>
 <style>
 :root{
   --bg:#070b12; --panel:#0d1420; --panel2:#111a29; --line:#1e2b3f;
@@ -185,20 +186,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
         + 运行时性能与效果全量记录(IndexedDB + CSV/JSON 导出)
    ============================================================ */
 
-// ---------- 配置(与 Python 管线对齐) ----------
-const CFG = {
-  motionThresh: 25,        // 帧差阈值
-  minAreaRatio: 0.0003,    // 最小运动面积(占画面)
-  confirmCount: 2,         // 多帧确认次数
-  motionDetInterval: 400,  // 快系统检出运动时，慢系统检测的最小间隔(ms)
-  patrolInterval: 5000,    // 无运动时巡检间隔(ms)
-  reconfirmInterval: 30000,// 已确认目标的重复告警间隔(ms)
-  maxAge: 2000,            // 跟踪老化(ms)
-  iouThresh: 0.1,
-  focalMeters: 4.4e-3,     // 手机等效焦距(米)
-  sensorHM: 3.6e-3,        // 传感器高度(米)
-  droneSizeM: 0.35,        // 目标实际尺寸(米, Mavic级)
-};
+// CFG / estimateDist / iou / Tracker / MotionGate 已抽取到 web/core.js（head 处 <script src> 共享）
 
 // ---------- 遥测记录器：性能 + 效果 ----------
 class Telemetry {
@@ -220,13 +208,13 @@ class Telemetry {
     try{ if(window.nativeBridge && window.nativeBridge.pushTelemetry)
       window.nativeBridge.pushTelemetry(JSON.stringify(ev)); }catch(e){}};
   // 周期性性能采样(每帧)
-  perf(frame,bootstrap,ff,bootstrapMs,detMs,trackMs,totalMs,zoom,detN,confN){
+  perf(frame,bootstrap,ff,bootstrapMs,detMs,trackMs,totalMs,zoom,detN,confN,mr){
     if(!this.recording) return;
     this.periodic.push({t:performance.now()-this.t0,frame,ff,bootstrap,ffMs:bootstrapMs,
-      detMs,trackMs,totalMs,zoom,detN,confN});
+      detMs,trackMs,totalMs,zoom,detN,confN,mr});
     // 每 30 帧归档一条性能记录
     if(this.periodic.length>=30){ this._log({ty:'perf',frame,ff,bootstrap,
-        ffMs:bootstrapMs,detMs,trackMs,totalMs,zoom,detN,confN}); this.periodic=[]; }
+        ffMs:bootstrapMs,detMs,trackMs,totalMs,zoom,detN,confN,mr}); this.periodic=[]; }
   }
   det(ev){ if(this.recording) this._log({ty:'det',cls:ev.cls,conf:ev.conf,dist:ev.dist||null,zoom:ev.zoom}); }
   conf(ev){ if(this.recording) this._log({ty:'conf',id:ev.id,dist:ev.dist||null}); }
@@ -251,7 +239,7 @@ class Telemetry {
     el.className='ev '+ev.ty;
     const ts=(ev.t/1000).toFixed(1);
     let body;
-    if(ev.ty==='perf') body=`<span class="tp">ff=${ev.ff.toFixed(1)} 检=${ev.detN} 确=${ev.confN} 变焦=${ev.zoom.toFixed(1)}</span>`;
+    if(ev.ty==='perf') body=`<span class="tp">ff=${ev.ff.toFixed(1)} 检=${ev.detN} 确=${ev.confN} 变焦=${ev.zoom.toFixed(1)} 运动=${ev.mr!==undefined?(ev.mr*100).toFixed(1)+'%':'—'}</span>`;
     else if(ev.ty==='det') body=`<span class="ty">检出</span> ${ev.cls} conf=${ev.conf} 距离=${ev.dist?ev.dist+'m':'—'} 变焦=${ev.zoom.toFixed(1)}`;
     else if(ev.ty==='conf') body=`<span class="ty">确认</span> 目标#${ev.id} 距离=${ev.dist?ev.dist+'m':'—'}`;
     else body=`<span class="ty">${ev.ty==='sys'?'系统':'错误'}</span> ${ev.msg||''}`;
@@ -275,93 +263,7 @@ class Telemetry {
 }
 const tele=new Telemetry();
 
-// ---------- 几何：距离估算(针孔模型) ----------
-function estimateDist(bboxHpx, frameHpx){
-  // D = (f * H_obj * frameH) / (h_px * sensorH)
-  // 注意：数字变焦只是 canvas 中心裁剪，检测始终在全帧上进行，
-  // 目标在全帧中的像素高度不随 zoom 变化——故这里不能除以 zoom
-  const normalized = bboxHpx / frameHpx;          // 占画面高度比例
-  const apparent = normalized * CFG.sensorHM;      // 像平面高度(米)
-  if(apparent<=0) return null;
-  return (CFG.focalMeters * CFG.droneSizeM) / apparent;
-}
-
-// ---------- IoU（框格式统一为 [x,y,w,h] 归一化数组） ----------
-function iou(a,b){
-  const x1=Math.max(a[0],b[0]),y1=Math.max(a[1],b[1]);
-  const x2=Math.min(a[0]+a[2],b[0]+b[2]),y2=Math.min(a[1]+a[3],b[1]+b[3]);
-  const iw=Math.max(0,x2-x1),ih=Math.max(0,y2-y1);
-  if(iw<=0||ih<=0) return 0;
-  const inter=iw*ih, ua=a[2]*a[3]+b[2]*b[3]-inter;
-  return ua>0?inter/ua:0;
-}
-
-// ---------- 目标跟踪器(IoU+中心距离, 恒速预测) ----------
-class Tracker{
-  constructor(){ this.tracks=new Map(); this.nextId=1; }
-  update(dets,now){
-    const active=new Set();
-    for(const d of dets){
-      let best=null,bestScore=1e9;
-      for(const [id,t] of this.tracks){
-        if(active.has(id)) continue;
-        // 恒速预测：两次检测间隔 0.4~5s，快速目标直接比对新位置必然错配
-        const dt=(now-t.last)/1000;
-        const px=t.cx+(t.vx||0)*dt, py=t.cy+(t.vy||0)*dt;
-        const shiftX=px-t.cx, shiftY=py-t.cy;
-        const pred=[t.box[0]+shiftX,t.box[1]+shiftY,t.box[2],t.box[3]];
-        const dist=Math.hypot(px-d.cx,py-d.cy);
-        const i=iou(pred,d.bbox);
-        const score=dist - i*200;   // IoU 优先,中心距离兜底
-        if(score<bestScore){bestScore=score;best=id;}
-      }
-      if(best!==null && bestScore<300){
-        const t=this.tracks.get(best);
-        const dt=(now-t.last)/1000;
-        if(dt>0.01){
-          const vx=(d.cx-t.cx)/dt, vy=(d.cy-t.cy)/dt;
-          t.vx=(t.vx||0)*0.6+vx*0.4; t.vy=(t.vy||0)*0.6+vy*0.4;  // 速度一阶平滑
-        }
-        t.box=d.bbox.slice(); t.cx=d.cx; t.cy=d.cy; t.last=now; t.count++;
-        active.add(best);
-        if(t.count>=CFG.confirmCount) t.confirmed=true;
-        d.trackId=best; d.dup=t.count;
-      }else{
-        const id=this.nextId++;
-        this.tracks.set(id,{id,box:d.bbox.slice(),cx:d.cx,cy:d.cy,vx:0,vy:0,
-          last:now,count:1,confirmed:false});
-        active.add(id); d.trackId=id; d.dup=1;
-      }
-    }
-    // 老化
-    for(const [id,t] of this.tracks) if(now-t.last>CFG.maxAge) this.tracks.delete(id);
-    return [...this.tracks.values()].filter(t=>active.has(t.id));
-  }
-  getConfirmed(){ return [...this.tracks.values()].filter(t=>t.confirmed); }
-}
-
-// ---------- 帧差运动门控(快系统)：逐帧廉价运行，有运动才升级慢系统检测 ----------
-class MotionGate{
-  constructor(){ this.prev=null; }
-  // gray: 扁平灰度数组；返回降采样坐标系运动框，无运动返回 []
-  detect(gray,gw,gh){
-    if(this.prev===null || this.prev.length!==gray.length){
-      this.prev=gray;   // gray 每帧新建，可直接持有
-      return [];
-    }
-    let cnt=0,minX=gw,maxX=0,minY=gh,maxY=0;
-    for(let i=0;i<gray.length;i++){
-      if(Math.abs(gray[i]-this.prev[i])>CFG.motionThresh){
-        cnt++;
-        const x=i%gw, y=(i/gw)|0;
-        if(x<minX)minX=x; if(x>maxX)maxX=x; if(y<minY)minY=y; if(y>maxY)maxY=y;
-      }
-    }
-    this.prev=gray;
-    if(!cnt || cnt/gw/gh<=CFG.minAreaRatio) return [];
-    return [{x:minX,y:minY,w:maxX-minX,h:maxY-minY}];
-  }
-}
+// 几何/跟踪/门控逻辑见 web/core.js
 
 // ---------- 真实无人机检测器（onnxruntime-web 加载 yolov8s-drone.onnx）----------
 // 复用 Python 管线验证过的真实模型：letterbox 预处理 + YOLOv8 NMS 后处理。
@@ -616,7 +518,7 @@ let jepa=new JepaDiscriminator();   // JEPA 特征判别 + 在线后训练
 let lastDet=0;
 let detecting=false;                // 慢系统在飞标志：wasm 推理期间 raf 重入不重复派发
 let frameCount=0, flip=false;
-let pendingFeedback=null;  // 待反馈目标特征 {feat,label} -> 触发在线学习
+let pendingFeedback=null;  // 待反馈目标 {feat,trackId,at} -> 在线学习（绑定目标与时效，防漂移）
 let pendingJepa=null;      // 最近一次 JEPA 判别结果(供 HUD 显示)
 
 // 变焦状态(平滑)
@@ -777,8 +679,14 @@ document.getElementById('btnClear').onclick=()=>{ tele.events=[]; document.getEl
 // ---------- JEPA 在线后训练反馈 ----------
 function jepaFeedback(label){
   if(!jepa.loaded){ toast('JEPA 未就绪'); return; }
-  if(!pendingFeedback){ toast('无待反馈目标，先检测到目标'); return; }
-  const n=jepa.feedback(pendingFeedback, label);
+  const pf=pendingFeedback;
+  if(!pf){ toast('无待反馈目标，先检测到目标'); return; }
+  // 防漂移：反馈必须落在仍在场的确认目标上，且特征是 15s 内提取的
+  const t=pf.trackId!==undefined? tracker.tracks.get(pf.trackId):null;
+  if(!t || !t.confirmed || performance.now()-pf.at>15000){
+    pendingFeedback=null; toast('目标已变化，请等下一次判别后再反馈'); return;
+  }
+  const n=jepa.feedback(pf.feat, label);
   toast(label===0?'已学习为鸟':'已学习为无人机 · 累计 '+n+' 样本');
   tele._log({ty:'sys',msg:'JEPA 在线学习 label='+label+' total='+n});
   pendingFeedback=null;
@@ -813,10 +721,7 @@ function startLoop(){
     toast('模型已加载，开始检测');
     tele._log({ty:'sys',msg:'模型加载完成 '+JSON.stringify(detector.names)});
   }).catch(e=>{ tele.err('模型加载失败:'+e.message); toast('模型加载失败'); });
-  // 预加载 JEPA 判别器（DINOv2 特征 + 探针头）
-  jepa.load().then(()=>{
-    tele._log({ty:'sys',msg:'JEPA 判别器就绪 acc='+((jepa.probe&&jepa.probe.acc)||'?')});
-  }).catch(e=>{ tele.err('JEPA 加载失败:'+e.message); });
+  // JEPA 懒加载：首次确认目标时才加载 DINOv2（features() 内部处理），避免开场白载 85MB
   loop();
 }
 
@@ -866,15 +771,15 @@ async function loop(){
         const b=d.bbox;
         const bx=b[0]/vw, by=b[1]/vh, bw=b[2]/vw, bh=b[3]/vh;
         return {cls:d.cls,conf:d.conf,bbox:[bx,by,bw,bh],cx:bx+bw/2,cy:by+bh/2,
-          dist:estimateDist(b[3],vh),zoom};
+          dist:estimateDist(b[3],vh,d.cls),zoom};
       });
       // 跟踪
       const t4=performance.now();
       tracker.update(dets,now);
       lastDet=now;
-      // JEPA 判别：只对已确认目标提特征并节流（DINOv2 是重活）——
-      // 首次确认立即判别，此后每 reconfirmInterval 重复一次（持续在场目标刷新学习特征）
-      if(jepa.loaded){
+      // JEPA 判别：只对已确认目标提特征并节流（DINOv2 是重活，且懒加载——
+      // 首次确认时才拉起模型，features() 内部 await load）；此后每 reconfirmInterval 重复
+      if(!jepa.loading){
         let top=null;
         for(const d of dets){
           const trk=d.trackId!==undefined? tracker.tracks.get(d.trackId):null;
@@ -889,7 +794,7 @@ async function loop(){
             const jp=jepa.predict(feat);
             top.jp=jp; pendingJepa=jp;
             top.feat=feat;   // 供反馈按钮做在线后训练
-            pendingFeedback=feat;
+            pendingFeedback={feat, trackId: top.trackId, at: now};
             const trk2=tracker.tracks.get(top.trackId); if(trk2) trk2.lastJepaAt=now;
             tele._log({ty:'det',cls:jp.label,conf:Math.round(jp.droneScore*1000)/1000,
               bird:Math.round(jp.birdScore*1000)/1000,dist:top.dist,zoom});
@@ -900,14 +805,14 @@ async function loop(){
       for(const t of tracker.tracks.values()){
         if(t.confirmed && (t.lastConfirmAt===undefined ||
                            now-t.lastConfirmAt>=CFG.reconfirmInterval)){
-          tele.conf({id:t.id,dist:estimateDist(t.box[3]*vh,vh)});
+          tele.conf({id:t.id,dist:estimateDist(t.box[3]*vh,vh,t.cls)});
           toast('⚠ 已确认无人机 #'+t.id); t.lastConfirmAt=now;
         }
       }
       const t5=performance.now();
       if(dets.length) tele.det(dets[0]);
       tele.perf(frameCount,video.currentTime,frameCount?1000/(performance.now()-t1):0,
-        t1-t0,t3-t2,t5-t4,t5-t0,zoom,dets.length,tracker.getConfirmed().length);
+        t1-t0,t3-t2,t5-t4,t5-t0,zoom,dets.length,tracker.getConfirmed().length,motionGate.lastRatio);
     }finally{
       detecting=false;
     }
@@ -955,7 +860,7 @@ function drawOverlay(vw,vh,t0){
     const vx=bx - (sx/vw)*ow, vy=by - (sy/vh)*oh;
     if(vx+ox<0||vy+oy<0||vx>ow||vy>oh) continue;
     const px=ox+vx, py=oy+vy;
-    const d=estimateDist(t.box[3]*vh,vh);
+    const d=estimateDist(t.box[3]*vh,vh,t.cls);
     octx.strokeStyle=t.confirmed?'#ff5d5d':'#35e0a1';
     octx.strokeRect(px,py,bw,bh);
     // 标签
@@ -973,7 +878,7 @@ function drawOverlay(vw,vh,t0){
   teleOut.innerHTML=`<div>帧率 <b>${(1000/(performance.now()-t0+1)).toFixed(1)}</b></div>
     <div>变焦 <b>${zoom.toFixed(1)}×</b></div>
     <div>目标 <b>${[...tracker.tracks.values()].length}</b> <span style="color:var(--dim)">确认</span> <b style="color:var(--warn)">${tracker.getConfirmed().length}</b></div>
-    <div style="color:var(--dim)">JEPA<sup>${jepa.loaded?'ON':'off'}</sup>
+    <div style="color:var(--dim)">JEPA<sup>${jepa.loading?'load…':(jepa.loaded?'ON':'off')}</sup>
       <span style="color:${!jepa.loaded?'var(--dim)':(pendingJepa&&pendingJepa.label==='drone'?'var(--warn)':'var(--accent)')}">
         ${pendingJepa?pendingJepa.label+(pendingJepa.droneScore>0.5?' '+pendingJepa.droneScore.toFixed(2):' '+pendingJepa.birdScore.toFixed(2)):'—'}
       </span></div>`;
