@@ -1,12 +1,12 @@
-# anti-drone-monitor — Realtime Anti-Drone Monitoring (Phone Demo)
+# anti-drone-monitor — Semantic Camera · Realtime Venue Monitoring (Phone Demo)
 
 [![CI](https://github.com/CommitStrip/anti-drone-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/CommitStrip/anti-drone-monitor/actions/workflows/ci.yml)
 
 **English** | [简体中文](README-CN.md)
 
-Turn a live video stream (Hikvision RTSP / phone camera / local video) into **on-device realtime drone detection and alerting**: frame-difference motion gating → triggered YOLOv8s detection → constant-velocity tracking + multi-frame confirmation → JEPA (DINOv2) bird/drone discrimination → target-following zoom. One HTML5 core runs on onnxruntime-web (pure wasm, no server-side inference), reused by both an Android WebView shell and a HarmonyOS ArkWeb shell.
+Turn a live video stream (Hikvision RTSP / phone camera / local video) into an **on-device realtime semantic camera**: frame-difference motion gating → triggered YOLOv8s detection → constant-velocity tracking + multi-frame confirmation → JEPA (DINOv2) fully-automatic semantic discrimination → target-following zoom. Discrimination is organized as **venue mode packs** — the first pack is "airfield anti-drone" (bird/drone discrimination and alerting); extending to a new venue only adds a mode-pack config plus a discrimination head, with zero pipeline changes (see `docs/semantic-camera-design.md`). One HTML5 core runs on onnxruntime-web (pure wasm, no server-side inference), reused by both an Android WebView shell and a HarmonyOS ArkWeb shell.
 
-Current validation status: probe-head offline accuracy **98.15%** (162 authoritative Drone-vs-Bird samples, evidence `web/jepa_probe_init.json`: acc=0.9815, n_train=162, dim=768); WHEP signaling verified end-to-end against a local MediaMTX v1.20.0 + H.264 test stream; **21 unit tests + GitHub Actions CI all green**. On-device end-to-end fps/latency benchmarks are **pending** — per-frame telemetry is already built in (see [Performance & validation status](#performance--validation-status)).
+Current validation status: probe-head offline accuracy **98.15%** (162 authoritative Drone-vs-Bird samples, evidence `web/jepa_probe_init.json`: acc=0.9815, n_train=162, dim=768); WHEP signaling verified end-to-end against a local MediaMTX v1.20.0 + H.264 test stream; **36 unit tests + GitHub Actions CI all green**. On-device end-to-end fps/latency benchmarks are **pending** — per-frame telemetry is already built in (see [Performance & validation status](#performance--validation-status)).
 
 ## Key capabilities
 
@@ -14,6 +14,7 @@ Current validation status: probe-head offline accuracy **98.15%** (162 authorita
 |------|------|
 | Realtime detection | Frame-difference gate (fast) → triggered detection (slow): motion fires detection within 400 ms, a 5 s patrol covers stillness; motion-area floor 0.003 suppresses sensor noise |
 | Target tracking | IoU + center-distance association + constant-velocity prediction (no track loss across long detection gaps), multi-frame confirmation (≥2) cuts false positives; confirmed targets get a 12 s survival window — hovering targets are not lost |
+| Fully-automatic semantic discrimination | JEPA four-state verdict: alert / pending-arbitration / cleared / suppressed — **no human judgment anywhere in the pipeline**; gray-zone cases enter a budget-capped arbitration queue; high-confidence dual-signal agreement auto-updates the probe head |
 | Smooth zoom | Pinch / slider / buttons + **target-following** auto-centering, smooth interpolation 1×-8× |
 | Distance estimation | Pinhole model with per-class size (drone 0.35 m / bird 0.20 m); digital zoom is a center crop and does not affect the reading |
 | Performance recording | Per-frame fps / stage latencies / gate motion ratio / detection events / confirmation events / zoom level |
@@ -41,12 +42,14 @@ The fast system runs frame differencing every frame on a 96×54 downscaled grays
 
 The core ships a real **YOLOv8s drone-detection model** (`web/yolov8s-drone.onnx`, 43 MB, onnxruntime-web + wasm), replacing the earlier synthetic `MotionDetector`. Full chain: letterbox preprocessing → inference → box/class parsing → class-wise NMS → IoU tracking & confirmation → target-following zoom. Inference time and detections stream into telemetry; wasm threads adapt to `SharedArrayBuffer` availability (single-threaded under WebView file://).
 
-## JEPA discrimination + online learning (integrated)
+## JEPA fully-automatic discrimination + auto evolution (integrated)
 
 On top of YOLO localization, a **JEPA-style self-supervised discriminator** (`web/dinov2_vits14_feat.onnx`, 85 MB, DINOv2-ViT-S feature extractor + `web/jepa_probe_init.json` linear probe head):
 
-- **Division of labor**: YOLO localizes (candidate boxes), DINOv2 discriminates (768-d features per crop → probe head → bird/drone confidence on the HUD).
-- **JEPA post-training**: onnxruntime-web supports inference only and cannot fine-tune the backbone, so "post-training" lands as **online lifelong learning** — on frozen DINOv2 features, user feedback ("🕊 bird / 🛸 drone") incrementally updates the probe head (centroid moving average + one-step SGD on the logreg head), persisted to `localStorage` (survives restarts). Feedback is bound to a target with a 15 s validity window to prevent mislabeling. "Reset learning" restores the initial weights.
+- **Division of labor**: YOLO localizes (candidate boxes), DINOv2 discriminates (768-d features per crop → probe head → confidence feeding the four-state verdict).
+- **Four-state fully-automatic verdict** (design red line: no step of the discrimination pipeline may depend on human judgment): the probe outputs P(target class); the policy emits `alert` (target side, high confidence → alert) / `escalate` (target side, low confidence → **abstain and queue for arbitration** — never a false alert) / `clear` (confidently not the target → suppress alert) / `suppress` (silent). Before a verdict exists, the detector is authoritative (no missed alerts).
+- **Auto evolution (no human-in-the-loop)**: on frozen DINOv2 features, when the logreg head and the prototype distance **agree with confidence ≥0.90**, the probe head updates itself (centroid moving average + one-step SGD with gradient descent), persisted to `localStorage` (survives restarts); "Reset learning" restores the initial weights (an ops action). The manual bird/drone feedback buttons are gone.
+- **Gray-zone arbitration queue**: `escalate` cases queue under a hard budget cap (20/hour) with per-track dedup (15 s TTL); events stream into telemetry (CSV/JSON exportable). Milestone M2 bridges the vus slow brain (VLM arbitration) whose verdicts feed back as pseudo-labels (see `docs/semantic-camera-design.md`).
 - Probe-head offline accuracy **98.15%** (162 authoritative Drone-vs-Bird samples; evidence in-repo at `web/jepa_probe_init.json`: acc=0.9815, n_train=162, dim=768).
 
 > Note: the DINOv2 model is ~85 MB; it is **lazy-loaded** — nothing is loaded at startup, the model is fetched on first confirmed target (HUD shows load…); discrimination runs only on **multi-frame-confirmed targets** (immediately on first confirmation, then refreshed every 30 s — not per frame, not per detection) to bound wasm-side inference cost.
@@ -89,12 +92,12 @@ See `harmony/README.md`. The core runs in an ArkWeb component; `javaScriptProxy`
 ## Development: tests, CI and multi-copy sync
 
 ```bash
-node --test tests/core.test.mjs     # 21 unit tests (node:test, zero deps)
+node --test tests/core.test.mjs     # 36 unit tests (node:test, zero deps)
 bash scripts/sync-web.sh            # web/ → android assets + harmony rawfile
 bash scripts/sync-web.sh --check    # consistency check only (same as CI)
 ```
 
-CI (node 20/22 matrix): JS syntax checks → unit tests → three-copy consistency. All pure logic (config/IoU/tracker/gate/ranging) lives in `web/core.js` with zero DOM dependencies, directly unit-testable; the `index.html` inline script has a syntax-guard test.
+CI (node 20/22 matrix): JS syntax checks → unit tests → three-copy consistency. All pure logic (config/IoU/tracker/gate/ranging/four-state policy/arbitration queue/probe-learning math) lives in `web/core.js` with zero DOM dependencies, directly unit-testable; the `index.html` inline script has a syntax-guard test.
 
 ## Performance & validation status
 
@@ -102,7 +105,7 @@ CI (node 20/22 matrix): JS syntax checks → unit tests → three-copy consisten
 |----|------|
 | WHEP signaling end-to-end | ✅ verified (MediaMTX v1.20.0 + H.264 test stream, OPTIONS→POST→PATCH→DELETE all pass) |
 | Probe-head offline accuracy | ✅ 98.15% (162 samples, `web/jepa_probe_init.json`) |
-| Unit tests / CI | ✅ 21 tests green, node 20/22 matrix |
+| Unit tests / CI | ✅ 36 tests green, node 20/22 matrix |
 | On-device fps/latency | ⏳ pending — telemetry already records per-frame `detMs/trackMs/motionRatio`; export CSV/JSON for measured data |
 
 Model size & strategy: YOLOv8s fp32 43 MB + DINOv2 85 MB; a single wasm-side inference takes seconds — hence detection is **trigger-based** (gating + cooldown) rather than per-frame, and JEPA runs only on confirmed targets with lazy loading.

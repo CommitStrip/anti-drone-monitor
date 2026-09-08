@@ -1,12 +1,12 @@
-# anti-drone-monitor — 反无人机实时监控（手机端演示）
+# anti-drone-monitor — 语义摄像头 · 实时场所语义监控（手机端演示）
 
 [![CI](https://github.com/CommitStrip/anti-drone-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/CommitStrip/anti-drone-monitor/actions/workflows/ci.yml)
 
 [English](README.md) | **简体中文**
 
-把一路实时视频流（海康 RTSP / 手机相机 / 本地视频）变成**端侧实时的无人机检测与告警**：帧差运动门控 → 触发式 YOLOv8s 检测 → 恒速跟踪 + 多帧确认 → JEPA（DINOv2）鸟/机判别 → 目标跟随变焦。一套 HTML5 核心跑在 onnxruntime-web（纯 wasm，无服务端推理），Android WebView 与 HarmonyOS ArkWeb 双端复用。
+把一路实时视频流（海康 RTSP / 手机相机 / 本地视频）变成**端侧实时的语义摄像头**：帧差运动门控 → 触发式 YOLOv8s 检测 → 恒速跟踪 + 多帧确认 → JEPA（DINOv2）全自动语义判别 → 目标跟随变焦。判别按**场所模式包**组织——首包"净空防黑飞"（鸟/机判别与告警），扩展新场所只需新增模式包数据与判别头，不改流水线代码（体系设计见 `docs/semantic-camera-design.md`）。一套 HTML5 核心跑在 onnxruntime-web（纯 wasm，无服务端推理），Android WebView 与 HarmonyOS ArkWeb 双端复用。
 
-当前验证状态：初始化探针头离线精度 **98.15%**（162 张权威 Drone-vs-Bird 样本，证据 `web/jepa_probe_init.json`：acc=0.9815, n_train=162, dim=768）；WHEP 信令已用本地 MediaMTX v1.20.0 + H.264 测试流完成端到端验证；**21 例单元测试 + GitHub Actions CI 全绿**。真机端到端帧率/延迟实测**待回填**——遥测已内置逐帧采集（见[性能与验证状态](#性能与验证状态)）。
+当前验证状态：初始化探针头离线精度 **98.15%**（162 张权威 Drone-vs-Bird 样本，证据 `web/jepa_probe_init.json`：acc=0.9815, n_train=162, dim=768）；WHEP 信令已用本地 MediaMTX v1.20.0 + H.264 测试流完成端到端验证；**36 例单元测试 + GitHub Actions CI 全绿**。真机端到端帧率/延迟实测**待回填**——遥测已内置逐帧采集（见[性能与验证状态](#性能与验证状态)）。
 
 ## 核心能力
 
@@ -14,6 +14,7 @@
 |------|------|
 | 实时检测 | 帧差运动门控(快) → 触发式检测(慢)：有运动 400ms 即检、无运动 5s 巡检兜底，运动面积门槛 0.003 抗传感器噪声 |
 | 目标跟踪 | IoU + 中心距离关联 + 恒速预测（大检测间隔不丢轨迹），多帧确认(≥2 次)降假阳性；已确认目标 12s 存活窗，悬停不丢 |
+| 全自动语义判别 | JEPA 四态裁决：告警 / 待仲裁 / 判明非目标 / 静默——**流水线无人工判定环节**；灰区入仲裁队列（预算硬上限），高置信双信号一致自动自训练探针 |
 | 丝滑变焦 | 捏合/滑块/按钮 + **目标跟随**自动居中，平滑插值 1×-8× |
 | 距离估算 | 针孔模型按类别尺寸粗估（无人机 0.35m / 鸟 0.20m）；数字变焦是中心裁剪，不影响读数 |
 | 性能记录 | 每帧 fps / 各阶段延迟 / 门控运动占比 / 检出事件 / 确认事件 / 变焦档位 |
@@ -41,12 +42,14 @@ drone-monitor-app/
 
 核心内置真实 **YOLOv8s 无人机检测模型**（`web/yolov8s-drone.onnx`，43MB，onnxruntime-web + wasm），替换掉先前的合成 `MotionDetector`。完整链路：letterbox 预处理 → 模型推理 → 坐标/类别解析 → 类内 NMS → IoU 跟踪确认 → 目标跟随变焦。推理耗时与检出结果实时写入遥测；wasm 线程按 `SharedArrayBuffer` 可用性自适应（WebView file:// 下自动单线程）。
 
-## JEPA 判别 + 在线后训练（已接入）
+## JEPA 全自动判别 + 自动进化（已接入）
 
 在 YOLO 定位之上叠加 **JEPA 风格自监督判别**（`web/dinov2_vits14_feat.onnx`，85MB，DINOv2-ViT-S 特征提取器 + `web/jepa_probe_init.json` 线性探针头）：
 
-- **分工**：YOLO 负责定位（检测候选框），DINOv2 负责判别（对候选框 crop 提 768 维特征，经探针头输出"鸟/无人机"置信度并在 HUD 显示）。
-- **JEPA 后训练**：onnxruntime-web 仅支持推理、无法微调 backbone，故"后训练"落地为**在线终身学习**——在冻结的 DINOv2 特征上，用户点"🕊 这是鸟 / 🛸 这是无人机"反馈后，用增量更新（质心滑动平均 + logreg 头单步 SGD）微调探针头，并持久化到 `localStorage`（重启保留）。反馈带目标绑定与 15s 时效校验，防止打在错误对象上。"重置学习"可恢复初始化权重。
+- **分工**：YOLO 负责定位（检测候选框），DINOv2 负责判别（对候选框 crop 提 768 维特征，经探针头输出置信度并参与四态裁决）。
+- **四态全自动裁决**（设计红线：判别流水线任何环节不得依赖人工判定）：探针输出 P(正类)，裁决器给出 `alert`（目标侧高置信 → 告警）/ `escalate`（目标侧置信不足 → **弃权待仲裁**，宁可不报不可虚报）/ `clear`（判明非目标 → 抑制告警）/ `suppress`（静默）四种语义态；判别结果未出前检测器权威（防漏报）。
+- **自动进化（无人工回路）**：在冻结的 DINOv2 特征上，当 logreg 头与原型距离**双信号一致且置信 ≥0.90** 时自动更新探针头（质心滑动平均 + logreg 单步 SGD，梯度下降），持久化到 `localStorage`（重启保留）；"重置学习"恢复初始化权重（运维操作）。人工判定按钮已废除。
+- **灰区仲裁队列**：`escalate` 案件按预算硬上限（20 件/小时）+ 按轨迹去重（15s TTL）排队，事件落遥测（CSV/JSON 可导出）；M2 接入 vus 慢脑 VLM 仲裁后，结论将作为伪标签回灌探针（见 `docs/semantic-camera-design.md` 里程碑）。
 - 初始化探针头离线精度 **98.15%**（162 张权威 Drone-vs-Bird 样本；证据见仓库内 `web/jepa_probe_init.json`：acc=0.9815, n_train=162, dim=768）。
 
 > 注意：DINOv2 模型约 85 MB；**懒加载**——开场不加载，首次确认目标时才拉起（HUD 显示 load…）；判别只对**多帧确认后的目标**触发（首次确认立即判别，此后每 30s 刷新一次，非每帧/非每次检出），以控制 wasm 端侧推理开销。
@@ -89,12 +92,12 @@ cd web && python3 -m http.server 8899
 ## 开发：测试、CI 与多端副本同步
 
 ```bash
-node --test tests/core.test.mjs     # 21 例单测（node:test，零依赖）
+node --test tests/core.test.mjs     # 36 例单测（node:test，零依赖）
 bash scripts/sync-web.sh            # web/ → android assets + harmony rawfile
 bash scripts/sync-web.sh --check    # 只校验一致性（CI 同款）
 ```
 
-CI（node 20/22 矩阵）：JS 语法检查 → 单元测试 → 三副本一致性校验。纯逻辑（配置/IoU/跟踪器/门控/估距）全部抽在 `web/core.js`，零 DOM 依赖可直接单测；`index.html` 内联脚本有语法守护测试。
+CI（node 20/22 矩阵）：JS 语法检查 → 单元测试 → 三副本一致性校验。纯逻辑（配置/IoU/跟踪器/门控/估距/四态裁决/仲裁队列/探针学习数学）全部抽在 `web/core.js`，零 DOM 依赖可直接单测；`index.html` 内联脚本有语法守护测试。
 
 ## 性能与验证状态
 
@@ -102,7 +105,7 @@ CI（node 20/22 矩阵）：JS 语法检查 → 单元测试 → 三副本一致
 |----|------|
 | WHEP 信令端到端 | ✅ 已验证（MediaMTX v1.20.0 + H.264 测试流，OPTIONS→POST→PATCH→DELETE 全通过） |
 | 探针头离线精度 | ✅ 98.15%（162 样本，`web/jepa_probe_init.json`） |
-| 单元测试 / CI | ✅ 21 例全绿，node 20/22 矩阵 |
+| 单元测试 / CI | ✅ 36 例全绿，node 20/22 矩阵 |
 | 真机帧率/延迟 | ⏳ 待回填——遥测已逐帧采集 `detMs/trackMs/motionRatio`，导出 CSV/JSON 即为实测数据 |
 
 模型体积与策略：YOLOv8s fp32 43MB + DINOv2 85MB，wasm 端单次推理为秒级——因此检测是**触发式**（门控+冷却）而非逐帧，JEPA 只对确认目标判别且懒加载。

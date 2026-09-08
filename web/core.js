@@ -126,7 +126,124 @@ class MotionGate{
   }
 }
 
+// ---------- 场所模式包（语义摄像头扩展，详见 docs/semantic-camera-design.md） ----------
+// 模式包 = 纯数据：换场所不改流水线代码，只换检测模型/判别头/告警规则。
+// 首包 airfield（净空防黑飞）即原反无人机能力的模式化收编。
+const MODE_PACKS = {
+  airfield: {
+    id: 'airfield',
+    name: '净空防黑飞',
+    detector: './yolov8s-drone.onnx',
+    discriminators: {
+      main: {
+        classes: ['bird', 'drone'],   // [负类, 正类]；探针 logreg 输出 P(正类)
+        probe: './jepa_probe_init.json',
+        alertConf: 0.80,              // 胜出侧置信 ≥ 此值才允许机器下结论
+      },
+    },
+    alertCls: 'drone',
+    arb: { budgetPerHour: 20, ttlMs: 15000 },  // 慢脑仲裁预算 + 按轨迹去重窗
+    selfTrain: { minConf: 0.90, marginRatio: 0.80, cooldownMs: 60000, lr: 0.05 },
+  },
+};
+
+function getModePack(name) {
+  return MODE_PACKS[name || 'airfield'] || MODE_PACKS.airfield;
+}
+
+// ---------- 判别裁决策略：四态全自动，流水线无人工判定环节 ----------
+// score: 探针输出的 P(正类)。目标侧置信不足宁可弃权（escalate 待仲裁）也不虚报；
+// 非目标侧一律 clear/suppress，不告警。
+class JepaPolicy {
+  constructor(pack) {
+    this.task = pack.discriminators.main;
+    this.alertCls = pack.alertCls;
+  }
+  decide(score) {
+    const neg = this.task.classes[0], pos = this.task.classes[1];
+    const isPos = score >= 0.5;
+    const label = isPos ? pos : neg;
+    const conf = isPos ? score : 1 - score;
+    if (label === this.alertCls) {
+      if (conf >= this.task.alertConf) return { action: 'alert', label, conf };
+      return { action: 'escalate', label, conf };   // 灰区：弃权待仲裁，不虚报
+    }
+    return conf >= this.task.alertConf
+      ? { action: 'clear', label, conf }
+      : { action: 'suppress', label, conf };
+  }
+}
+
+// ---------- 慢脑仲裁队列：预算硬上限 + 按轨迹 TTL 去重（触发式/单飞合并语义） ----------
+class ArbitrationQueue {
+  constructor(opts) { this.budget = opts.budgetPerHour; this.ttl = opts.ttlMs; this.items = []; }
+  // 返回 'accepted' | 'dup'（同轨迹窗口内已申请）| 'budget'（小时窗预算用尽）
+  request(trackId, now) {
+    this.items = this.items.filter(e => now - e.at < 3600000);   // 预算按小时窗滚动
+    if (this.items.some(e => e.trackId === trackId && now - e.at < this.ttl)) return 'dup';
+    if (this.items.length >= this.budget) return 'budget';
+    this.items.push({ trackId, at: now });
+    return 'accepted';
+  }
+}
+
+// ---------- 探针在线学习的纯数学（自动自训练与仲裁回灌共用，Node 可单测） ----------
+// 探针统一为归一化形态 {logreg_w, logreg_b, protos:[负类质心, 正类质心], ns:[负类样本数, 正类样本数]}
+function logregScore(probe, feat) {   // P(正类)
+  let s = probe.logreg_b;
+  for (let i = 0; i < feat.length; i++) s += probe.logreg_w[i] * feat[i];
+  return 1 / (1 + Math.exp(-s));
+}
+function protoDist(probe, feat) {     // [到负类质心距离, 到正类质心距离]
+  let d0 = 0, d1 = 0;
+  for (let i = 0; i < feat.length; i++) {
+    const a = feat[i] - probe.protos[0][i], b = feat[i] - probe.protos[1][i];
+    d0 += a * a; d1 += b * b;
+  }
+  return [Math.sqrt(d0), Math.sqrt(d1)];
+}
+function weightedAvg(oldV, feat, n) {
+  return oldV.map((v, i) => (v * n + feat[i]) / (n + 1));
+}
+// label: 0=负类 1=正类。质心增量 + logreg 头单步 SGD（梯度下降）
+function probeLearn(probe, feat, label, lr) {
+  probe.protos[label] = weightedAvg(probe.protos[label], feat, probe.ns[label]);
+  probe.ns[label]++;
+  const err = logregScore(probe, feat) - label;   // err = p - y，沿负梯度更新
+  for (let i = 0; i < feat.length; i++) probe.logreg_w[i] -= lr * err * feat[i];
+  probe.logreg_b -= lr * err;
+  return probe;
+}
+// 自训练门控：logreg 头与原型距离两个独立信号一致且足够确信，才允许自动更新
+// 探针（防止"错误但自信"的判决被自我强化）。
+function shouldSelfTrain(probe, feat, opts) {
+  const s = logregScore(probe, feat);
+  const conf = s >= 0.5 ? s : 1 - s;
+  if (conf < opts.minConf) return false;
+  const d = protoDist(probe, feat);
+  const winner = s >= 0.5 ? d[1] : d[0], loser = s >= 0.5 ? d[0] : d[1];
+  if (loser <= 0 || winner / loser > opts.marginRatio) return false;
+  return true;
+}
+// 兼容旧版探针字段（proto_bird/proto_drone 等）→ 归一化形态；classes[i] 给出第 i 类类名
+function normalizeProbe(raw, classes) {
+  if (raw.protos && raw.ns) {
+    return { logreg_w: raw.logreg_w, logreg_b: raw.logreg_b,
+             protos: raw.protos, ns: raw.ns };
+  }
+  const pick = i => {
+    const m = raw['proto_' + classes[i]], n = raw['n_' + classes[i]];
+    if (!m) throw new Error('探针缺少类 ' + classes[i] + ' 的原型字段');
+    return { m, n: n || 0 };
+  };
+  const a = pick(0), b = pick(1);
+  return { logreg_w: raw.logreg_w, logreg_b: raw.logreg_b,
+           protos: [a.m, b.m], ns: [a.n, b.n] };
+}
+
 // ---------- Node 单测入口（浏览器端 module 未定义，此块不执行） ----------
 if (typeof module!=='undefined' && module.exports) {
-  module.exports = { CFG, estimateDist, iou, Tracker, MotionGate };
+  module.exports = { CFG, estimateDist, iou, Tracker, MotionGate,
+    MODE_PACKS, getModePack, JepaPolicy, ArbitrationQueue,
+    logregScore, protoDist, weightedAvg, probeLearn, shouldSelfTrain, normalizeProbe };
 }
