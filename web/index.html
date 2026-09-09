@@ -162,6 +162,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   <div class="row">
     <label>模式</label>
     <span id="modeName" style="flex:1;font-size:11px;color:var(--dim)"></span>
+    <button class="btn small" id="btnProbeUndo" title="回滚到上一次探针更新前（审计日志见导出）">撤销学习</button>
     <button class="btn small" id="btnProbeReset">重置学习</button>
   </div>
   <div class="recpanel" id="recpanel">
@@ -493,15 +494,48 @@ class JepaDiscriminator{
   }
   // P(正类)——四态裁决(JepaPolicy)的输入
   score(feat){ return logregScore(this.probe,feat); }
-  // 自动学习（label: 0=负类 1=正类）：质心增量 + logreg 单步 SGD，纯数学在 core.js
-  learn(feat, label, lr){
+  // 自动学习（label: 0=负类 1=正类）：质心增量 + logreg 单步 SGD，纯数学在 core.js。
+  // 带审计：更新前快照（单步回滚锚点）+ 更新日志（来源/前后置信/类间距比）——
+  // 生产化受控学习（候选池/灰度发布/回滚策略）归主线 semantic-camera，本仓先闭环证据链。
+  learn(feat, label, lr, source='self-train', meta={}){
+    const before=this.score(feat);
+    const prev=JSON.stringify(this.probe);
     probeLearn(this.probe,feat,label,lr);
+    const after=this.score(feat);
+    const d=protoDist(this.probe,feat);
+    const margin=(label===1? d[1]/(d[0]+1e-8) : d[0]/(d[1]+1e-8));  // 类间距比，越小分得越开
     this.rid++;
+    this.lastAudit={before,after,margin,rid:this.rid};
+    try{
+      localStorage.setItem('jepa_probe_prev',prev);          // 单步回滚锚点
+      const log=this.auditLog();
+      log.push({at:new Date().toISOString(),rid:this.rid,source,label,
+        before:+before.toFixed(4),after:+after.toFixed(4),margin:+margin.toFixed(3),...meta});
+      while(log.length>20) log.shift();
+      localStorage.setItem('jepa_probe_log',JSON.stringify(log));
+    }catch(e){}
     this.saveProbe();
     return this.probe.ns[0]+this.probe.ns[1];
   }
+  auditLog(){
+    try{ return JSON.parse(localStorage.getItem('jepa_probe_log')||'[]'); }catch(e){ return []; }
+  }
+  // 回滚到上一次更新前的探针（连续调用在最近两版间切换；操作本身入审计日志）
+  rollbackProbe(){
+    const prev=localStorage.getItem('jepa_probe_prev');
+    if(!prev) return false;
+    try{
+      localStorage.setItem('jepa_probe_v2',prev);
+      this.probe=JSON.parse(prev);
+      const log=this.auditLog();
+      log.push({at:new Date().toISOString(),rid:++this.rid,source:'rollback'});
+      localStorage.setItem('jepa_probe_log',JSON.stringify(log));
+      return true;
+    }catch(e){ return false; }
+  }
   async resetProbe(){
-    try{ localStorage.removeItem('jepa_probe_v2'); localStorage.removeItem('jepa_probe'); this.probe=null; }catch(e){}
+    try{ localStorage.removeItem('jepa_probe_v2'); localStorage.removeItem('jepa_probe');
+         this.probe=null; }catch(e){}
     return this.loadProbe();
   }
 }
@@ -585,11 +619,13 @@ document.getElementById('btnHik').onclick=()=>{
   const p=document.getElementById('hikpanel');
   p.classList.toggle('open');
   if(p.classList.contains('open')){
-    // 回填上次配置
-    ['hkHost','hkPath','hkUser','hkPass'].forEach(id=>{
+    // 回填上次配置：网关地址/路径/用户名可持久化，密码只读会话级存储
+    ['hkHost','hkPath','hkUser'].forEach(id=>{
       const v=localStorage.getItem('hik_'+id);
       if(v!==null) document.getElementById(id).value=v;
     });
+    const savedPass=sessionStorage.getItem('hik_hkPass');
+    if(savedPass!==null) document.getElementById('hkPass').value=savedPass;
   }
 };
 document.getElementById('btnHikClose').onclick=()=>document.getElementById('hikpanel').classList.remove('open');
@@ -660,7 +696,11 @@ document.getElementById('btnHikGo').onclick=async()=>{
   const user=document.getElementById('hkUser').value.trim();
   const pass=document.getElementById('hkPass').value;
   if(!host||!path){ toast('请填写网关地址与流路径'); return; }
-  ['hkHost','hkPath','hkUser','hkPass'].forEach(id=>localStorage.setItem('hik_'+id,document.getElementById(id).value));
+  // 凭据治理：地址/路径/用户名可持久化；密码只进 sessionStorage（关闭页面即清），
+  // 并清除历史版本明文落盘的密码（XSS/调试口/备份泄露面收敛）
+  ['hkHost','hkPath','hkUser'].forEach(id=>localStorage.setItem('hik_'+id,document.getElementById(id).value));
+  sessionStorage.setItem('hik_hkPass',document.getElementById('hkPass').value);
+  localStorage.removeItem('hik_hkPass');
   stopNetSource();
   toast('正在连接海康流 '+path+' …');
   const base=host.replace(/\/+$/,'');
@@ -701,10 +741,14 @@ document.getElementById('btnExpCSV').onclick=()=>tele.exportCSV();
 document.getElementById('btnExpJSON').onclick=()=>tele.exportJSON();
 document.getElementById('btnClear').onclick=()=>{ tele.events=[]; document.getElementById('log').innerHTML=''; document.getElementById('evCount').textContent='0 条'; };
 
-// ---------- JEPA 运维：重置学习（恢复初始化权重，非判定环节） ----------
+// ---------- JEPA 运维：重置学习（恢复初始化权重）/ 撤销学习（单步回滚，非判定环节） ----------
 document.getElementById('btnProbeReset').onclick=async()=>{
   await jepa.resetProbe(); pendingJepa=null;
   toast('JEPA 探针已重置为初始化权重');
+};
+document.getElementById('btnProbeUndo').onclick=()=>{
+  if(jepa.rollbackProbe()){ pendingJepa=null; toast('已撤销最近一次探针更新'); }
+  else toast('没有可撤销的更新');
 };
 
 function setStatus(t,rec){ document.getElementById('statusTxt').textContent=t;
@@ -807,14 +851,18 @@ async function loop(){
             const trk2=tracker.tracks.get(top.trackId);
             if(trk2){ trk2.lastJepaAt=now; trk2.verdict=verdict; }  // 裁决挂轨迹（告警语义用）
             if(verdict.action==='alert'||verdict.action==='clear'){
-              // 边缘自训练：logreg 头与原型距离双信号一致才更新，防止错误自我强化
+              // 边缘自训练：logreg 头与原型距离双信号一致才更新，防止错误自我强化；
+              // 更新带审计（快照+日志+可回滚），生产化受控学习归主线 semantic-camera
               if(shouldSelfTrain(jepa.probe,feat,pack.selfTrain)
                  && (!trk2 || now-(trk2.autoLearnedAt||0)>pack.selfTrain.cooldownMs)){
                 const n=jepa.learn(feat,
-                  verdict.label===pack.discriminators.main.classes[1]?1:0, pack.selfTrain.lr);
+                  verdict.label===pack.discriminators.main.classes[1]?1:0,
+                  pack.selfTrain.lr,'self-train',{trackId:top.trackId});
                 if(trk2) trk2.autoLearnedAt=now;
                 tele._log({ty:'sys',msg:'JEPA 自训练 '+verdict.label+' conf='+
-                  verdict.conf.toFixed(2)+' 样本='+n});
+                  verdict.conf.toFixed(2)+' 探针置信 '+
+                  jepa.lastAudit.before.toFixed(2)+'→'+jepa.lastAudit.after.toFixed(2)+
+                  ' 样本='+n});
               }
               tele._log({ty:'det',cls:verdict.label,conf:Math.round(verdict.conf*1000)/1000,
                 act:verdict.action,dist:top.dist,zoom});

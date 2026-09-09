@@ -1,0 +1,43 @@
+{
+  "manifest_version": 1,
+  "generated": "2026-09-09",
+  "note": "Hashes refer to web/ sources; packaged copies (android assets, harmony rawfile) must match — enforced by scripts/sync-web.sh --check.",
+  "models": [
+    {
+      "file": "web/yolov8s-drone.onnx",
+      "sha256": "7e5e3bf66dc3325c24bc7397d2f6e3460925eacef8d702a1177317e8a2ad64ad",
+      "bytes": 44746522,
+      "role": "venue detector (airfield pack)",
+      "source": "custom fine-tuned export, opset 12",
+      "license": "AGPL-3.0 (ultralytics-derived weights)",
+      "commercial_use": "restricted — see THIRD_PARTY_NOTICES.md"
+    },
+    {
+      "file": "web/dinov2_vits14_feat.onnx",
+      "sha256": "859fcada5b3138a88d8b38b5f627dec5c646732a07b9ac6c1acf3b85a443ea16",
+      "bytes": 89110468,
+      "role": "DINOv2 ViT-S/14 feature tower",
+      "source": "export of facebookresearch/dinov2 vision tower",
+      "license": "code Apache-2.0; official weights CC-BY-NC 4.0 (non-commercial)",
+      "commercial_use": "restricted — see THIRD_PARTY_NOTICES.md"
+    },
+    {
+      "file": "web/ort-wasm-simd-threaded.wasm",
+      "sha256": "d1ab1b94b16a65b29d710d0b587b29e7bed336827577623913479b8afe8113e6",
+      "bytes": 13479978,
+      "role": "onnxruntime-web wasm runtime",
+      "source": "bundled onnxruntime-web build",
+      "license": "MIT",
+      "commercial_use": "allowed"
+    },
+    {
+      "file": "web/jepa_probe_init.json",
+      "sha256": "be6d6f3dc5ff01bbbd1f6e0c898defed7d1df5d5dcbae2bd014fa88e8a0a49ae",
+      "bytes": 51025,
+      "role": "linear probe head init (acc=0.9815, n=162)",
+      "source": "offline training in this project",
+      "license": "MIT (project data)",
+      "commercial_use": "allowed"
+    }
+  ]
+}

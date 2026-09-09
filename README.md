@@ -6,9 +6,9 @@
 
 > **Evolution notice**: this project has grown into the family mainline **[semantic-camera](https://github.com/CommitStrip/semantic-camera)** — a venue-mode semantic camera platform (mode packs / fully-automatic discrimination / spatiotemporal rules & multi-camera roadmap). This repo remains as the single-scene anti-drone demo, frozen for maintenance; issues and development continue in the mainline repo.
 
-Turn a live video stream (Hikvision RTSP / phone camera / local video) into an **on-device realtime semantic camera**: frame-difference motion gating → triggered YOLOv8s detection → constant-velocity tracking + multi-frame confirmation → JEPA (DINOv2) fully-automatic semantic discrimination → target-following zoom. Discrimination is organized as **venue mode packs** — the first pack is "airfield anti-drone" (bird/drone discrimination and alerting); extending to a new venue only adds a mode-pack config plus a discrimination head, with zero pipeline changes (see `docs/semantic-camera-design.md`). One HTML5 core runs on onnxruntime-web (pure wasm, no server-side inference), reused by both an Android WebView shell and a HarmonyOS ArkWeb shell.
+Turn a live video stream (Hikvision RTSP / phone camera / local video) into a semantic camera delivering **realtime on-device video monitoring + triggered, non-realtime heavy-model discrimination**: frame-difference motion gating → triggered YOLOv8s detection → constant-velocity tracking + multi-frame confirmation → JEPA (DINOv2) fully-automatic semantic discrimination → target-following zoom. Video display and frame gating are per-frame realtime; heavy models run per event with second-scale bounded latency for verdicts — an honest compute budget for edge hardware, not per-frame full-model realtime. Discrimination is organized as **venue mode packs** — the first pack is "airfield anti-drone" (bird/drone discrimination and alerting); extending to a new venue only adds a mode-pack config plus a discrimination head, with zero pipeline changes (see `docs/semantic-camera-design.md`). One HTML5 core runs on onnxruntime-web (pure wasm, no server-side inference), reused by both an Android WebView shell and a HarmonyOS ArkWeb shell.
 
-Current validation status: probe-head offline accuracy **98.15%** (162 authoritative Drone-vs-Bird samples, evidence `web/jepa_probe_init.json`: acc=0.9815, n_train=162, dim=768); WHEP signaling verified end-to-end against a local MediaMTX v1.20.0 + H.264 test stream; **36 unit tests + GitHub Actions CI all green**. On-device end-to-end fps/latency benchmarks are **pending** — per-frame telemetry is already built in (see [Performance & validation status](#performance--validation-status)).
+Current validation status: probe-head offline accuracy **98.15%** (162 authoritative Drone-vs-Bird samples — an **in-sample figure**, evidence `web/jepa_probe_init.json`: acc=0.9815, n_train=162, dim=768; train/test split protocol and cross-scene generalization are pending documentation and must not be read as system capability); WHEP signaling verified end-to-end against a local MediaMTX v1.20.0 + H.264 test stream (signaling and transport path, not a real-scene detection evaluation); **36 unit tests + GitHub Actions CI all green**. On-device end-to-end fps/latency benchmarks are **pending** — per-frame telemetry is already built in (see [Performance & validation status](#performance--validation-status)).
 
 ## Key capabilities
 
@@ -100,6 +100,12 @@ bash scripts/sync-web.sh --check    # consistency check only (same as CI)
 ```
 
 CI (node 20/22 matrix): JS syntax checks → unit tests → three-copy consistency. All pure logic (config/IoU/tracker/gate/ranging/four-state policy/arbitration queue/probe-learning math) lives in `web/core.js` with zero DOM dependencies, directly unit-testable; the `index.html` inline script has a syntax-guard test.
+
+Ops & security governance (frozen-maintenance edition):
+
+- **Probe updates carry an evidence chain** — every automatic update snapshots the previous probe (`jepa_probe_prev`), appends an audit log (`jepa_probe_log`: time/source/before-after confidence/class-separation margin, capped at 20), and the UI offers a one-step "Undo learning" rollback; production-grade controlled learning (candidate pool / staged rollout) belongs to the mainline.
+- **Credentials never hit disk in plaintext** — the Hikvision gateway password lives only in `sessionStorage` (cleared when the page closes); only address/path/username persist, and legacy plaintext passwords are wiped on connect.
+- **Model asset licensing** — bundled weights follow their upstream licenses (AGPL-3.0 / CC-BY-NC 4.0); manifest and hashes in `MODEL_MANIFEST.json`, terms in `THIRD_PARTY_NOTICES.md`.
 
 ## Performance & validation status
 
