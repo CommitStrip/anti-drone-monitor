@@ -4,6 +4,8 @@
 
 **English** | [简体中文](README-CN.md)
 
+> **Evolution notice**: this project has grown into the family mainline **[semantic-camera](https://github.com/CommitStrip/semantic-camera)** — a venue-mode semantic camera platform (mode packs / fully-automatic discrimination / spatiotemporal rules & multi-camera roadmap). This repo remains as the single-scene anti-drone demo, frozen for maintenance; issues and development continue in the mainline repo.
+
 Turn a live video stream (Hikvision RTSP / phone camera / local video) into an **on-device realtime semantic camera**: frame-difference motion gating → triggered YOLOv8s detection → constant-velocity tracking + multi-frame confirmation → JEPA (DINOv2) fully-automatic semantic discrimination → target-following zoom. Discrimination is organized as **venue mode packs** — the first pack is "airfield anti-drone" (bird/drone discrimination and alerting); extending to a new venue only adds a mode-pack config plus a discrimination head, with zero pipeline changes (see `docs/semantic-camera-design.md`). One HTML5 core runs on onnxruntime-web (pure wasm, no server-side inference), reused by both an Android WebView shell and a HarmonyOS ArkWeb shell.
 
 Current validation status: probe-head offline accuracy **98.15%** (162 authoritative Drone-vs-Bird samples, evidence `web/jepa_probe_init.json`: acc=0.9815, n_train=162, dim=768); WHEP signaling verified end-to-end against a local MediaMTX v1.20.0 + H.264 test stream; **36 unit tests + GitHub Actions CI all green**. On-device end-to-end fps/latency benchmarks are **pending** — per-frame telemetry is already built in (see [Performance & validation status](#performance--validation-status)).

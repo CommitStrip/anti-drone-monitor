@@ -4,6 +4,8 @@
 
 [English](README.md) | **简体中文**
 
+> **演进说明**：本项目已升级为库系主线 **[semantic-camera](https://github.com/CommitStrip/semantic-camera)**——场所模式语义摄像头平台（模式包化 / 全自动判别 / 时空规则与多相机调度路线）。本仓保留为反无人机单场景演示，冻结维护，Issue 与开发请移步主仓。
+
 把一路实时视频流（海康 RTSP / 手机相机 / 本地视频）变成**端侧实时的语义摄像头**：帧差运动门控 → 触发式 YOLOv8s 检测 → 恒速跟踪 + 多帧确认 → JEPA（DINOv2）全自动语义判别 → 目标跟随变焦。判别按**场所模式包**组织——首包"净空防黑飞"（鸟/机判别与告警），扩展新场所只需新增模式包数据与判别头，不改流水线代码（体系设计见 `docs/semantic-camera-design.md`）。一套 HTML5 核心跑在 onnxruntime-web（纯 wasm，无服务端推理），Android WebView 与 HarmonyOS ArkWeb 双端复用。
 
 当前验证状态：初始化探针头离线精度 **98.15%**（162 张权威 Drone-vs-Bird 样本，证据 `web/jepa_probe_init.json`：acc=0.9815, n_train=162, dim=768）；WHEP 信令已用本地 MediaMTX v1.20.0 + H.264 测试流完成端到端验证；**36 例单元测试 + GitHub Actions CI 全绿**。真机端到端帧率/延迟实测**待回填**——遥测已内置逐帧采集（见[性能与验证状态](#性能与验证状态)）。
