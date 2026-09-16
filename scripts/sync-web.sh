@@ -17,6 +17,7 @@ FILES=(
   whep-client.js
   hls.min.js
   jepa_probe_init.json
+  yolov8s-drone-int8.onnx
   ort.wasm.js
   ort-wasm-simd-threaded.mjs
   ort-wasm-simd-threaded.wasm

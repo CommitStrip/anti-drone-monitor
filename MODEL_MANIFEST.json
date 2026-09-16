@@ -13,6 +13,15 @@
       "commercial_use": "restricted — see THIRD_PARTY_NOTICES.md"
     },
     {
+      "file": "web/yolov8s-drone-int8.onnx",
+      "sha256": "3a94ef5dfb86a8a9962bb3cfa712d5f9eead5a7cb33410136b7559b83bc4e18d",
+      "bytes": 15889217,
+      "role": "venue detector (airfield pack), int8 preferred + fp32 fallback",
+      "source": "opset 12→16 转换后 QOperator QLinearConv 量化（类头/解码尾部排除），经任务级闸门验证（检出 41→42、IoU 0.907、1.57× 提速）；工具 scripts/quantize_opset_convert.py",
+      "license": "AGPL-3.0 (ultralytics-derived weights)",
+      "commercial_use": "restricted — see THIRD_PARTY_NOTICES.md"
+    },
+    {
       "file": "web/dinov2_vits14_feat.onnx",
       "sha256": "859fcada5b3138a88d8b38b5f627dec5c646732a07b9ac6c1acf3b85a443ea16",
       "bytes": 89110468,
